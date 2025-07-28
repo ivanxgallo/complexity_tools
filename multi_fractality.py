@@ -5,6 +5,48 @@ import matplotlib.pyplot as plt
 from matplotlib.cm import get_cmap
 from scipy.interpolate import UnivariateSpline, interp1d
 from tqdm.notebook import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+def _compute_mfdfa_single_q(ts, profile, scales, q_val, order, double):
+    N = len(ts)
+    flucts = []
+
+    for s in scales:
+        num_segments = N // s
+        if num_segments < 2:
+            continue
+
+        F_nu = []
+
+        # Adelante
+        for v in range(num_segments):
+            segment = profile[v * s:(v + 1) * s]
+            x = np.arange(s)
+            poly = np.polyfit(x, segment, order)
+            trend = np.polyval(poly, x)
+            detrended = segment - trend
+            F_nu.append(np.mean(detrended ** 2))
+
+        # Reverso
+        if double:
+            for v in range(num_segments):
+                segment = profile[N - (v + 1) * s:N - v * s]
+                x = np.arange(s)
+                poly = np.polyfit(x, segment, order)
+                trend = np.polyval(poly, x)
+                detrended = segment - trend
+                F_nu.append(np.mean(detrended ** 2))
+
+        # Función de fluctuación
+        if q_val != 0:
+            F_s = (np.mean(np.array(F_nu) ** (q_val / 2))) ** (1 / q_val)
+        else:
+            F_s = np.exp(0.5 * np.mean(np.log(F_nu)))
+
+        flucts.append(F_s)
+
+    return q_val, scales[:len(flucts)], np.array(flucts)
+
 
 class MultiFractality:
     def __init__(self, time_series):
@@ -49,7 +91,8 @@ class MultiFractality:
         plt.show()
 
 
-    def mfdfa(self, q=2, min_scale=10, max_scale=1000, n_scales=50, order=1, double=False):
+    def mfdfa(self, q=2, min_scale=10, max_scale=1000,
+                n_scales=50, order=1, double=False, parallel=True):
         """
         Aplica el algoritmo MFDFA a la serie de tiempo para uno o varios valores de q.
 
@@ -60,6 +103,7 @@ class MultiFractality:
         - n_scales: número de escalas a considerar
         - order: orden del polinomio para el detrending
         - double: si True, usa ventanas al derecho y al revés
+        - parallel: si True, calcula para cada q en paralelo
 
         Almacena:
         - self.mfdfa_results[q]: diccionario con claves "scales" y "flucts" para cada q
@@ -72,90 +116,70 @@ class MultiFractality:
         raw_scales = np.logspace(np.log10(min_scale), np.log10(max_scale), num=n_scales)
         scales = np.unique(np.floor(raw_scales).astype(int))
 
-        # Asegurar formato iterable
         q_list = [q] if np.isscalar(q) else list(q)
 
-        for q_val in tqdm(q_list, desc="Computing MFDFA for each q"):
-            flucts = []
+        if parallel:
+            with ProcessPoolExecutor() as executor:
+                futures = {
+                    executor.submit(_compute_mfdfa_single_q, ts, profile, scales, q_val, order, double): q_val
+                    for q_val in q_list
+                }
 
-            for s in tqdm(scales, desc=f"Scales for q={q_val}"):
-                num_segments = N // s
-                if num_segments < 2:
-                    continue
+                for future in tqdm(as_completed(futures), total=len(futures), desc="MFDFA parallel"):
+                    q_val, s_vals, flucts = future.result()
+                    self.mfdfa_results[q_val] = {
+                        "scales": s_vals,
+                        "flucts": flucts
+                    }
 
-                F_nu = []
-
-                # Adelante
-                for v in range(num_segments):
-                    segment = profile[v * s:(v + 1) * s]
-                    x = np.arange(s)
-                    poly = np.polyfit(x, segment, order)
-                    trend = np.polyval(poly, x)
-                    detrended = segment - trend
-                    F_nu.append(np.mean(detrended ** 2))
-
-                # Reverso (doble recorrido)
-                if double:
-                    for v in range(num_segments):
-                        segment = profile[N - (v + 1) * s:N - v * s]
-                        x = np.arange(s)
-                        poly = np.polyfit(x, segment, order)
-                        trend = np.polyval(poly, x)
-                        detrended = segment - trend
-                        F_nu.append(np.mean(detrended ** 2))
-
-                # Función de fluctuación para cada q
-                if q_val != 0:
-                    F_s = (np.mean(np.array(F_nu) ** (q_val / 2))) ** (1 / q_val)
-                else:
-                    F_s = np.exp(0.5 * np.mean(np.log(F_nu)))
-
-                flucts.append(F_s)
-
-            # Guardar resultado para este q
-            self.mfdfa_results[q_val] = {
-                "scales": scales[:len(flucts)],
-                "flucts": np.array(flucts)
-            }
+        else:
+            for q_val in tqdm(q_list, desc="MFDFA sequential"):
+                q_val, s_vals, flucts = _compute_mfdfa_single_q(ts, profile, scales, q_val, order, double)
+                self.mfdfa_results[q_val] = {
+                    "scales": s_vals,
+                    "flucts": flucts
+                }
 
 
-    def plot_fluctuations(self, q_list=None, loglog=True, cmap_name='tab10',
+    def plot_fluctuations(self, q=None, loglog=True, cmap_name='tab10',
                       fs_labels=12, fs_legend=10, **kwargs):
         """
         Grafica F_q(s) vs s para uno o varios valores de q.
 
         Parámetros:
-        - q_list: lista de valores de q a graficar (si None, se usan todos los disponibles)
+        - q: valor escalar o lista de valores de q a graficar (si None, se usan todos los disponibles)
         - loglog: si True, usa escala log-log
         - cmap_name: nombre del colormap para distinguir curvas
         - fs_labels: tamaño de fuente de etiquetas
         - fs_legend: tamaño de fuente de leyenda
-        - correction: factor multiplicativo opcional para F_q(s)
         - **kwargs: argumentos extra para personalizar cada curva (e.g., alpha, linestyle)
         """
         if not hasattr(self, "mfdfa_results") or len(self.mfdfa_results) == 0:
             raise ValueError("No hay resultados de MFDFA disponibles.")
 
         # Determinar qué q graficar
-        q_list = sorted(self.mfdfa_results.keys()) if q_list is None else q_list
-        if not isinstance(q_list, (list, tuple, np.ndarray)):
-            q_list = [q_list]
+        if q is None:
+            q_list = sorted(self.mfdfa_results.keys())
+        elif isinstance(q, (list, tuple, np.ndarray)):
+            q_list = list(q)
+        else:
+            q_list = [q]
 
         plt.figure(dpi=kwargs.pop('dpi', 200))
         cmap = get_cmap(cmap_name)
 
-        for i, q in enumerate(q_list):
-            if q not in self.mfdfa_results:
-                print(f"Aviso: q = {q} no ha sido calculado, se omite.")
+        for i, q_val in enumerate(q_list):
+            if q_val not in self.mfdfa_results:
+                print(f"[WARN] q = {q_val} no ha sido calculado, se omite.")
                 continue
 
-            data = self.mfdfa_results[q]
+            data = self.mfdfa_results[q_val]
             s = np.array(data["scales"])
             F = np.array(data["flucts"])
             color = cmap(i % cmap.N)
 
             plt.plot(s, F,
-                    label=fr"$q={q}$",
+                    label=fr"$q={q_val}$",
                     color=color,
                     alpha=kwargs.get('alpha', 0.8),
                     linestyle=kwargs.get('linestyle', '-'),
@@ -175,78 +199,98 @@ class MultiFractality:
         plt.show()
 
 
-    def fit_hq(self, q_value, s_min, s_max):
+
+    def fit_hq(self, q=None, s_min=10, s_max=1000):
         """
         Ajusta una recta log-log a F(s) vs s entre s_min y s_max,
-        y devuelve la pendiente h(q).
+        y devuelve la pendiente h(q) para cada q especificado o para todos los q disponibles.
 
         Parámetros:
+        - q: escalar, lista o None. Si es None, se ajusta para todos los q en self.mfdfa_results
         - s_min: escala mínima a considerar
         - s_max: escala máxima a considerar
 
-        Retorna:
-        - h_q: exponente de Hurst generalizado estimado por ajuste lineal
+        Guarda en self.mfdfa_results[q]:
+        - h: exponente de Hurst estimado
+        - error_h: error estándar del ajuste lineal
+        - intercept: A del ajuste log-log
+        - range: tupla con (s_min, s_max)
         """
-        # Convertir q_value a lista si es un valor único
-        if not isinstance(q_value, (list, tuple, np.ndarray)):
-            q_list = [q_value]
+        # Si q es None, usar todas las claves existentes
+        if q is None:
+            q_list = list(self.mfdfa_results.keys())
+        elif not isinstance(q, (list, tuple, np.ndarray)):
+            q_list = [q]
         else:
-            q_list = q_value
+            q_list = q
 
-        for q in q_list:
-            if q not in self.mfdfa_results.keys():
-                print(f"Debes ejecutar mfdfa para q={q} antes de ajustar h(q)")
+        for q_val in q_list:
+            if q_val not in self.mfdfa_results:
+                print(f"[WARN] Debes ejecutar mfdfa para q={q_val} antes de ajustar h(q)")
+                continue
 
-            else:
-                s = np.array(self.mfdfa_results[q]["scales"])
-                F = np.array(self.mfdfa_results[q]["flucts"])
+            s = np.array(self.mfdfa_results[q_val]["scales"])
+            F = np.array(self.mfdfa_results[q_val]["flucts"])
 
-                # Filtrar por el rango dado
-                mask = (s >= s_min) & (s <= s_max)
-                log_s = np.log(s[mask])
-                log_F = np.log(F[mask])
+            # Filtrar por el rango dado
+            mask = (s >= s_min) & (s <= s_max)
+            log_s = np.log(s[mask])
+            log_F = np.log(F[mask])
 
-                coeffs, cov = np.polyfit(log_s, log_F, 1, cov=True)
-                h_q = coeffs[0]
-                log_A = coeffs[1]
-                A = np.exp(log_A) # Intercepto log-log y = A * x^h
-                error_h = np.sqrt(cov[0, 0])
+            # Ajuste lineal log-log
+            coeffs, cov = np.polyfit(log_s, log_F, 1, cov=True)
+            h_q = coeffs[0]
+            log_A = coeffs[1]
+            A = np.exp(log_A)
+            error_h = np.sqrt(cov[0, 0])
 
-                # Guardar en el diccionario
-                self.mfdfa_results[q].update(
-                    {
-                        "h": h_q,
-                        "error_h": error_h,
-                        "intercept": A,
-                        "range": (s_min, s_max)
-                    }
-                )
+            # Guardar resultados
+            self.mfdfa_results[q_val].update({
+                "h": h_q,
+                "error_h": error_h,
+                "intercept": A,
+                "range": (s_min, s_max)
+            })
 
-                print(f"[INFO] Fit for q={q}: h(q)={h_q:.4f}")
-
+            print(f"[INFO] Fit for q={q_val}: h(q) = {h_q:.4f} ± {error_h:.4f}")
 
 
-    def plot_fit_hq(self, q_list, correction=1.0, fs_legend=10, cmap_name='tab20', **kwargs):
+
+    def plot_fit_hq(self, q=None, correction=1.0, fs_legend=10, cmap_name='tab20', **kwargs):
         """
         Plotea F_q(s) vs s y su ajuste para uno o varios valores de q ajustados anteriormente.
 
         Parámetros:
-        - q_list: valor o lista de valores de q ajustados anteriormente
-        - correction: factor multiplicativo opcional (se aplica a todos los q)
+        - q: valor o lista de valores de q ajustados anteriormente (si None, se grafican todos los disponibles con ajuste)
+        - correction: factor multiplicativo opcional (se aplica a todos los F_q(s))
         """
-        if not isinstance(q_list, (list, tuple, np.ndarray)):
-            q_list = [q_list]  # convierte a lista si es un solo q
+        # Determinar lista de q
+        if q is None:
+            q_list = [k for k in self.mfdfa_results if "h" in self.mfdfa_results[k]]
+        elif isinstance(q, (list, tuple, np.ndarray)):
+            q_list = list(q)
+        else:
+            q_list = [q]
+
+        if len(q_list) == 0:
+            print("[WARN] No hay valores de q con ajuste realizado (h, intercept).")
+            return
 
         plt.figure(dpi=kwargs.pop('dpi', 200))
         cmap = get_cmap(cmap_name)
 
-        for i, q in enumerate(q_list):
-            assert q in self.mfdfa_results.keys(), f"Debes ejecutar mfdfa para q={q} antes de graficar."
+        for i, q_val in enumerate(q_list):
+            if q_val not in self.mfdfa_results:
+                print(f"[WARN] Debes ejecutar mfdfa para q={q_val} antes de graficar.")
+                continue
+            if "h" not in self.mfdfa_results[q_val] or "intercept" not in self.mfdfa_results[q_val]:
+                print(f"[WARN] Falta ajuste para q={q_val}. Ejecuta fit_hq primero.")
+                continue
 
-            color = cmap(i % cmap.N)  # Garantiza que no exceda el rango del colormap
-            s = np.array(self.mfdfa_results[q]["scales"])
-            F = np.array(self.mfdfa_results[q]["flucts"])
-            result = self.mfdfa_results[q]
+            color = cmap(i % cmap.N)
+            s = np.array(self.mfdfa_results[q_val]["scales"])
+            F = np.array(self.mfdfa_results[q_val]["flucts"])
+            result = self.mfdfa_results[q_val]
             h_q = result["h"]
             A = result["intercept"]
             s_min, s_max = result["range"]
@@ -256,17 +300,18 @@ class MultiFractality:
             F_fit = correction * A * s_fit ** h_q
 
             # Plot datos y ajuste
-            plt.plot(s, F, 'o-', label=fr"Data $q={q}$", color=color, alpha=0.5)
-            plt.plot(s_fit, F_fit, 'k-', label=fr"$q={q}$ fit: $s^{{{h_q:.2f}}}$")
+            plt.plot(s, correction * F, 'o-', label=fr"Data $q={q_val}$", color=color, alpha=0.5)
+            plt.plot(s_fit, F_fit, 'k-', label=fr"$q={q_val}$ fit: $s^{{{h_q:.2f}}}$")
 
         plt.xscale('log')
         plt.yscale('log')
         plt.xlabel(r"$s$")
         plt.ylabel(r"$F_q(s)$")
-        plt.legend(fontsize = fs_legend)
+        plt.legend(fontsize=fs_legend)
         plt.grid(True, which='both', linestyle='--', alpha=0.3)
         plt.tight_layout()
         plt.show()
+
 
 
     def plot_hq_vs_q(self, marker='o', color='tab:blue', fs_labels=12,
@@ -510,12 +555,12 @@ class MultiFractality:
         return D0
 
 
-    def remove_q_results(self, q_value):
+    def remove_q_results(self, q):
         """
         Elimina los resultados almacenados para uno o varios valores específicos de q.
 
         Parámetro:
-        - q_value: valor único o lista/array/tupla de valores de q que se desean eliminar.
+        - q: valor escalar o iterable de valores de q que se desean eliminar.
 
         Efecto:
         - Elimina las entradas correspondientes de self.mfdfa_results
@@ -523,18 +568,88 @@ class MultiFractality:
         if not hasattr(self, "mfdfa_results"):
             raise AttributeError("No hay resultados de MFDFA disponibles.")
 
-        # Convertir q_value a lista si es un valor único
-        if not isinstance(q_value, (list, tuple, np.ndarray)):
-            q_list = [q_value]
+        # Convertir q a lista si es un valor único
+        if isinstance(q, (list, tuple, np.ndarray)):
+            q_list = q
         else:
-            q_list = q_value
+            q_list = [q]
 
-        for q in q_list:
-            if q in self.mfdfa_results:
-                del self.mfdfa_results[q]
-                print(f"[INFO] Results for q = {q} have been eliminated.")
+        for q_val in q_list:
+            if q_val in self.mfdfa_results:
+                del self.mfdfa_results[q_val]
+                print(f"[INFO] Resultados para q = {q_val} eliminados.")
             else:
-                print(f"[WARN] Does not found results for q = {q}.")
+                print(f"[WARN] No se encontraron resultados para q = {q_val}.")
 
 
 
+'''
+    def mfdfa(self, q=2, min_scale=10, max_scale=1000, n_scales=50, order=1, double=False):
+        """
+        Aplica el algoritmo MFDFA a la serie de tiempo para uno o varios valores de q.
+
+        Parámetros:
+        - q: valor escalar o lista/array de valores q (puede incluir q=0)
+        - min_scale: menor longitud de escala (s)
+        - max_scale: mayor longitud de escala (s)
+        - n_scales: número de escalas a considerar
+        - order: orden del polinomio para el detrending
+        - double: si True, usa ventanas al derecho y al revés
+
+        Almacena:
+        - self.mfdfa_results[q]: diccionario con claves "scales" y "flucts" para cada q
+        """
+        ts = self.series
+        N = len(ts)
+        mean_ts = np.mean(ts)
+        profile = np.cumsum(ts - mean_ts)
+
+        raw_scales = np.logspace(np.log10(min_scale), np.log10(max_scale), num=n_scales)
+        scales = np.unique(np.floor(raw_scales).astype(int))
+
+        # Asegurar formato iterable
+        q_list = [q] if np.isscalar(q) else list(q)
+
+        for q_val in tqdm(q_list, desc="Computing MFDFA for each q"):
+            flucts = []
+
+            for s in tqdm(scales, desc=f"Scales for q={q_val}", leave=False):
+                num_segments = N // s
+                if num_segments < 2:
+                    continue
+
+                F_nu = []
+
+                # Adelante
+                for v in range(num_segments):
+                    segment = profile[v * s:(v + 1) * s]
+                    x = np.arange(s)
+                    poly = np.polyfit(x, segment, order)
+                    trend = np.polyval(poly, x)
+                    detrended = segment - trend
+                    F_nu.append(np.mean(detrended ** 2))
+
+                # Reverso (doble recorrido)
+                if double:
+                    for v in range(num_segments):
+                        segment = profile[N - (v + 1) * s:N - v * s]
+                        x = np.arange(s)
+                        poly = np.polyfit(x, segment, order)
+                        trend = np.polyval(poly, x)
+                        detrended = segment - trend
+                        F_nu.append(np.mean(detrended ** 2))
+
+                # Función de fluctuación para cada q
+                if q_val != 0:
+                    F_s = (np.mean(np.array(F_nu) ** (q_val / 2))) ** (1 / q_val)
+                else:
+                    F_s = np.exp(0.5 * np.mean(np.log(F_nu)))
+
+                flucts.append(F_s)
+
+            # Guardar resultado para este q
+            self.mfdfa_results[q_val] = {
+                "scales": scales[:len(flucts)],
+                "flucts": np.array(flucts)
+            }
+'''
