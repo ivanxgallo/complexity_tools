@@ -226,7 +226,7 @@ class MultiFractality:
 
 
 
-    def plot_fit_hq(self, q_list, correction=1.0, fs_legend=10, cmap_name='tab20'):
+    def plot_fit_hq(self, q_list, correction=1.0, fs_legend=10, cmap_name='tab20', **kwargs):
         """
         Plotea F_q(s) vs s y su ajuste para uno o varios valores de q ajustados anteriormente.
 
@@ -237,7 +237,7 @@ class MultiFractality:
         if not isinstance(q_list, (list, tuple, np.ndarray)):
             q_list = [q_list]  # convierte a lista si es un solo q
 
-        plt.figure(dpi=200)
+        plt.figure(dpi=kwargs.pop('dpi', 200))
         cmap = get_cmap(cmap_name)
 
         for i, q in enumerate(q_list):
