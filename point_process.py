@@ -3,8 +3,9 @@
 import pandas as pd
 import numpy as np
 import networkx as nx
-from collections import Counter
 import matplotlib.pyplot as plt
+from collections import Counter
+
 
 class PointProcess:
     def __init__(self, dim=2, directed=False):
