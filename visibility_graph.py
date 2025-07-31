@@ -48,6 +48,80 @@ def _vg_visible_edges(i, series):
     return edges
 
 
+def compare_degree_distributions(vg_list, kind='total', labels=None,
+                                colors=None, markers=None, linestyles=None,
+                                fit_linestyle='--', fit_color='black',
+                                fit_range=None, dpi=200, figsize=(8, 6)):
+    """
+    Compara las distribuciones de conectividad y sus ajustes para múltiples objetos VG.
+
+    Parámetros:
+    - vg_list: lista de objetos VisibilityGraph
+    - kind: tipo de grado ('total', 'in', 'out')
+    - labels: lista opcional de etiquetas para la leyenda
+    - colors, markers, linestyles: listas opcionales de estilos
+    - fit_linestyle, fit_color: estilo del ajuste
+    - fit_range: tupla (k_min, k_max) para forzar el mismo rango de ajuste
+    """
+    plt.figure(dpi=dpi, figsize=figsize)
+
+    for idx, vg in enumerate(vg_list):
+        label = labels[idx] if labels else f"VG {idx+1}"
+        color = colors[idx] if colors else None
+        marker = markers[idx] if markers else 'o'
+        linestyle = linestyles[idx] if linestyles else '-'
+
+        # Recuperar k y pk
+        data = vg.degree_distributions.get(kind)
+        if data is None:
+            print(f"[WARN] VG {idx+1} no tiene distribución almacenada para '{kind}'")
+            continue
+        k_vals = data["k"]
+        pk_vals = data["pk"]
+
+        plt.plot(k_vals, pk_vals, label=label, marker=marker,
+                    linestyle=linestyle, color=color)
+
+        # Obtener ajuste (forzar cálculo si hay fit_range)
+        if fit_range is not None:
+            try:
+                vg.fit_degree_slope(kind=kind, k_min=fit_range[0], k_max=fit_range[1],
+                                    plot=False, store=True)
+            except Exception as e:
+                print(f"[ERROR] Ajuste fallido para VG {idx+1}: {e}")
+                continue
+
+        fit = vg.degree_fit_results.get(kind)
+        if fit:
+            slope = fit["slope"]
+            intercept = fit["intercept"]
+            k_min, k_max = fit["range"]
+            log_x = fit["log_x"]
+            log_y = fit["log_y"]
+
+            k_fit = k_vals[(k_vals >= k_min) & (k_vals <= k_max)]
+            if log_x and log_y:
+                pk_fit = np.exp(intercept) * k_fit ** slope
+                fit_label = fr"Fit {label}: $P(k) \sim k^{{{slope:.2f}}}$"
+                plt.xscale('log')
+            elif not log_x and log_y:
+                pk_fit = np.exp(intercept + slope * k_fit)
+                fit_label = fr"Fit {label}: $P(k) \sim \exp({slope:.2f}k)$"
+            else:
+                print(f"[WARN] VG {idx+1}: combinación no implementada (log_x={log_x}, log_y={log_y})")
+                continue
+
+            plt.plot(k_fit, pk_fit, linestyle=fit_linestyle, color=fit_color, label=fit_label)
+
+    plt.xlabel(r"$k$")
+    plt.ylabel(r"$P(k)$")
+    plt.yscale('log')
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+
 class VisibilityGraph:
     def __init__(self, time_series, kind='VG', directed=None):
         """
@@ -143,46 +217,6 @@ class VisibilityGraph:
             self._add_edge(i, j)
 
 
-    '''
-    def _build_hvg(self):
-        """
-        Construye el Horizontal Visibility Graph (HVG) de forma eficiente.
-        """
-        N = len(self.time_series)
-        for i in tqdm(range(N), desc="Construyendo HVG"):
-            self.graph.add_node(i)
-            for j in range(i + 1, N):
-                yi = self.time_series[i]
-                yj = self.time_series[j]
-                obstructed = False
-                for k in range(i + 1, j):
-                    if self.time_series[k] >= min(yi, yj):
-                        obstructed = True
-                        break
-                if not obstructed:
-                    self._add_edge(i, j)
-
-    def _build_vg(self):
-        """
-        Construye el Visibility Graph (VG) convencional.
-        """
-        N = len(self.time_series)
-        for i in tqdm(range(N), desc="Construyendo VG"):
-            self.graph.add_node(i)
-            for j in range(i + 1, N):
-                visible = True
-                for k in range(i + 1, j):
-                    yi = self.time_series[i]
-                    yj = self.time_series[j]
-                    yk = self.time_series[k]
-                    y_interp = yi + (yj - yi) * (k - i) / (j - i)
-                    if yk >= y_interp:
-                        visible = False
-                        break
-                if visible:
-                    self._add_edge(i, j)
-    '''
-
     def connectivity_count(self, kind='total'):
         """
         Retorna un diccionario con la distribución de conectividad P(k),
@@ -219,6 +253,23 @@ class VisibilityGraph:
         degree_list = list(range(1, max_degree + 1))
         count_list = [count.get(k, 0) for k in degree_list]
 
+        if not hasattr(self, "degree_distributions"):
+            self.degree_distributions = {}
+
+        total = sum(count_list)
+        k_vals = np.array(degree_list)
+        pk_vals = np.array([c / total for c in count_list])
+
+        # Eliminar valores donde P(k) == 0 por robustez
+        nonzero_mask = pk_vals > 0
+        k_vals = k_vals[nonzero_mask]
+        pk_vals = pk_vals[nonzero_mask]
+
+        self.degree_distributions[kind] = {
+            "k": k_vals,
+            "pk": pk_vals
+        }
+
         return degree_list, count_list
 
 
@@ -249,12 +300,20 @@ class VisibilityGraph:
         total_nodos = np.sum(cuentas)
         pk = cuentas / total_nodos
 
-        plt.figure(dpi=dpi, **kwargs)
+        # Filtrar valores donde pk > 0
+        mask_nonzero = pk > 0
+        grados = grados[mask_nonzero]
+        pk = pk[mask_nonzero]
+
+        plt.figure(dpi=dpi, figsize=kwargs.pop('figsize', (7,5)))
         plt.plot(grados, pk, marker=kwargs.pop('marker','o'),
                     linestyle=kwargs.pop('linestyle','-'),
-                    linewidth=kwargs.pop('linewidth',1.5), label=r"$P(k)$ data")
+                    linewidth=kwargs.pop('linewidth',1.5),
+                    label=r"$P(k)$ data", **kwargs)
         plt.xlabel(r"$k$", fontsize=kwargs.pop("fs_labels", 15))
         plt.ylabel(r"$P(k)$", fontsize=kwargs.pop("fs_labels", 15))
+        plt.xticks(fontsize=kwargs.pop('xticksize', None))
+        plt.yticks(fontsize=kwargs.pop('yticksize', None))
 
         # Mostrar ajuste si está disponible
         if show_fit:
@@ -327,6 +386,11 @@ class VisibilityGraph:
         p_vals = np.array(p_vals)
         pk = p_vals / p_vals.sum()
 
+        # Filtrar valores donde pk > 0
+        mask_nonzero = pk > 0
+        k_vals = k_vals[mask_nonzero]
+        pk = pk[mask_nonzero]
+
         if k_max is None:
             k_max = max(k_vals)
 
@@ -360,10 +424,12 @@ class VisibilityGraph:
             }
 
         if plot:
-            plt.figure(dpi=200)
+            plt.figure(dpi=200, figsize=kwargs.pop('figsize', (7,5)))
             plt.plot(k_vals, pk, label=r'$P(k)$ data',
                     marker=kwargs.pop('marker', 'o'),
-                    color=kwargs.pop('color', 'red'), **kwargs)
+                    linestyle=kwargs.pop('linestyle','-'),
+                    color=kwargs.pop('color', 'red'),
+                    linewidth=kwargs.pop('linewidth',1.5), **kwargs)
 
             k_fit = k_vals[mask]
             if log_x and log_y:
@@ -385,8 +451,10 @@ class VisibilityGraph:
 
             if title:
                 plt.title(f"Ajuste para '{kind}' (log_x={log_x}, log_y={log_y})")
-            plt.xlabel(r"$k$")
-            plt.ylabel(r"$P(k)$")
+            plt.xlabel(r"$k$", fontsize=kwargs.pop("fs_labels", 15))
+            plt.ylabel(r"$P(k)$", fontsize=kwargs.pop("fs_labels", 15))
+            plt.xticks(fontsize=kwargs.pop('xticksize', None))
+            plt.yticks(fontsize=kwargs.pop('yticksize', None))
             plt.legend()
             plt.grid(True, which='both', linestyle='--', alpha=0.4)
             plt.tight_layout()
@@ -424,11 +492,12 @@ class VisibilityGraph:
                 linewidth=kwargs.pop('linewidth', 1.5),
                 marker=kwargs.pop('marker', ''),
                 alpha=kwargs.pop('alpha', 0.9),
-                label=kwargs.pop('label', None),
-                **kwargs)
+                label=kwargs.pop('label', None))
 
-        plt.xlabel(xlabel, fontsize=kwargs.pop('fs_labels', 12))
-        plt.ylabel(ylabel, fontsize=kwargs.pop('fs_labels', 12))
+        fs_labels = kwargs.pop('fs_labels', 15)
+        plt.ylabel(ylabel, fontsize=fs_labels)
+        plt.xlabel(xlabel, fontsize=fs_labels)
+
         plt.title(title, fontsize=kwargs.pop('fs_title', 14))
         plt.grid(True, linestyle='--', alpha=0.3)
 
@@ -444,6 +513,9 @@ class VisibilityGraph:
 
         if ylim is not None:
             plt.ylim(ylim)
+
+        plt.xticks(fontsize=kwargs.pop('xticksize', None))
+        plt.yticks(fontsize=kwargs.pop('yticksize', None))
 
         plt.tight_layout()
         plt.show()
