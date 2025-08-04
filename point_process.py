@@ -5,9 +5,10 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 from collections import Counter
+from tqdm.notebook import tqdm
 
 
-class PointProcess:
+class PointProcessNetwork:
     def __init__(self, dim=2, directed=False):
         self.dim = dim
         self.events = None
@@ -89,7 +90,7 @@ class PointProcess:
             if cell not in self.graph:
                 # Calcular centro de la celda
                 center = []
-                for i, idx in enumerate(cell):
+                for i, idx in enumerate(tqdm(cell)):
                     edge_start = self.grid['edges'][i][idx]
                     edge_end = self.grid['edges'][i][idx + 1]
                     center.append(0.5 * (edge_start + edge_end))
@@ -134,7 +135,8 @@ class PointProcess:
         return degree_list, count_list
 
 
-    def plot_degree_histogram(self, kind='total', xlim=None, ylim=None, dpi=200):
+    def plot_degree_histogram(self, kind='total', xlim=None, ylim=None,
+                                dpi=200, log_x=True,**kwargs):
         """
         Muestra un histograma de grados P(k) con escalas logarítmicas.
 
@@ -147,25 +149,24 @@ class PointProcess:
         total_nodos = sum(cuentas)
         pk = [c / total_nodos for c in cuentas]
 
-        plt.figure(dpi=dpi)
-        plt.plot(grados, pk, marker='o', linestyle='-', linewidth=1)
-        plt.xlabel(r"$k$")
-        plt.ylabel(r"$P(k)$")
-        plt.xscale('log')
+        plt.figure(dpi=dpi, figsize=kwargs.pop('figsize', (7,5)))
+        plt.plot(grados, pk, marker=kwargs.pop('marker', 'o'),
+                            linestyle=kwargs.pop('linestyle', '-'),
+                            linewidth=kwargs.pop('linewidth', 1))
+        plt.xlabel(r"$k$", fontsize=kwargs.pop('fs_label', 15))
+        plt.ylabel(r"$P(k)$", fontsize=kwargs.pop('fs_label', 15))
+        if log_x:
+            plt.xscale('log')
         plt.yscale('log')
         plt.grid(True, which='both', linestyle='--', alpha=0.5)
-
-        # Aplicar límites si el usuario los define
-        if xlim is not None:
-            plt.xlim(xlim)
-        if ylim is not None:
-            plt.ylim(ylim)
-
+        plt.xlim(xlim)
+        plt.ylim(ylim)
         plt.tight_layout()
         plt.show()
 
 
-    def plot_graph(self, with_labels=False, node_size=100, edge_color='gray'):
+    def plot_graph(self, with_labels=False, node_size=100, edge_color='gray',
+                    xlabel="x", ylabel="y", **kwargs):
         """
         Dibuja el grafo en 2D, usando las posiciones espaciales de los nodos.
 
@@ -176,15 +177,115 @@ class PointProcess:
         """
         pos = nx.get_node_attributes(self.graph, 'pos')
 
-        plt.figure(dpi=200)
+        plt.figure(dpi=kwargs.pop('dpi', 200), figsize=kwargs.pop('figsize', (7,7)))
         nx.draw(
-            self.graph, 
-            pos=pos, 
-            with_labels=with_labels, 
+            self.graph,
+            pos=pos,
+            with_labels=with_labels,
             node_size=node_size,
             edge_color=edge_color,
             node_color='skyblue'
         )
+        plt.xlabel(fr"${{{xlabel}}}$", fontsize=kwargs.pop('fs_label', 17))
+        plt.ylabel(fr"${{{ylabel}}}$", fontsize=kwargs.pop('fs_label', 17))
         plt.axis('equal')
         plt.tight_layout()
         plt.show()
+
+
+
+class EvolvingNetwork:
+    def __init__(self, point_process_df, time_col='t', space_cols=None, dim=2, directed=False):
+        self.df = point_process_df.sort_values(by=time_col).reset_index(drop=True)
+        self.time_col = time_col
+        self.space_cols = space_cols
+        self.dim = dim
+        self.directed = directed
+        self.snapshots = []  # Lista de tuplas (timestamp, PointProcessNetwork)
+        self.stats = []      # Lista de dicts con stats globales por snapshot
+
+
+    def build_by_time_window(self, window_size, step_size, cell_size=1.0):
+        """
+        Parámetros:
+        - window_size: timedelta o float (segundos)
+        - step_size: timedelta o float (segundos)
+        """
+        t_values = pd.to_datetime(self.df[self.time_col])
+        t_start = t_values.min()
+        t_end = t_values.max()
+
+        current = t_start
+        while current + window_size <= t_end:
+            mask = (t_values >= current) & (t_values < current + window_size)
+            window_df = self.df[mask]
+            if len(window_df) == 0:
+                current += step_size
+                continue
+            timestamp = window_df[self.time_col].mean()
+
+            ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
+            ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
+            ppn.create_grid(cell_size)
+            ppn.build_sequential_graph()
+
+            self.snapshots.append((timestamp, ppn))
+            self.stats.append(self._get_graph_stats(ppn.graph))
+
+            current += step_size
+
+
+    def build_by_event_window(self, window_size=1000, step=200, cell_size=1.0):
+        for start in range(0, len(self.df) - window_size + 1, step):
+            end = start + window_size
+            window_df = self.df.iloc[start:end]
+            timestamp = window_df[self.time_col].mean()
+
+            ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
+            ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
+            ppn.create_grid(cell_size)
+            ppn.build_sequential_graph()
+
+            self.snapshots.append((timestamp, ppn))
+            self.stats.append(self._get_graph_stats(ppn.graph))
+
+
+    def do_evolution(self, method="event", **kwargs):
+        """
+        Ejecuta la evolución de la red según el método indicado.
+
+        Parámetros:
+        - method: "event" o "time"
+        - kwargs: parámetros para pasar al método correspondiente
+        """
+        if method == "event":
+            self.build_by_event_window(**kwargs)
+        elif method == "time":
+            self.build_by_time_window(**kwargs)
+        else:
+            raise ValueError("Method must be 'event' or 'time'")
+
+
+    def _get_graph_stats(self, G):
+        return {
+            'n_nodes': G.number_of_nodes(),
+            'n_edges': G.number_of_edges(),
+            'density': nx.density(G),
+            'k_avg': np.mean([d for n, d in G.degree()]) if G.number_of_nodes() > 0 else 0,
+        }
+
+
+    def plot_stat(self, stat_name, **kwargs):
+        times = [t for t, _ in self.snapshots]
+        values = [s[stat_name] for s in self.stats]
+        plt.figure(dpi=200)
+        plt.plot(times, values, marker='o')
+        plt.title(f"Evolución de {stat_name}")
+        plt.xlabel("Tiempo")
+        plt.ylabel(stat_name)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+
+

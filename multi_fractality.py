@@ -6,6 +6,11 @@ from matplotlib.cm import get_cmap
 from scipy.interpolate import UnivariateSpline, interp1d
 from tqdm.notebook import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from scipy.optimize import curve_fit
+
+def arccot(x, A, B, C, D):
+    return A + B * np.arctan(C * x + D)
+
 
 def _compute_mfdfa_single_q(ts, profile, scales, q_val, order, double):
     N = len(ts)
@@ -142,7 +147,8 @@ class MultiFractality:
 
 
     def plot_fluctuations(self, q=None, loglog=True, cmap_name='tab10',
-                      fs_labels=12, fs_legend=10, **kwargs):
+                        fs_labels=12, fs_legend=10, legend=True,
+                        xlim=None, ylim=None, **kwargs):
         """
         Grafica F_q(s) vs s para uno o varios valores de q.
 
@@ -193,8 +199,11 @@ class MultiFractality:
 
         plt.xlabel(r"$s$", fontsize=fs_labels)
         plt.ylabel(r"$F_q(s)$", fontsize=fs_labels)
+        plt.xlim(xlim)
+        plt.ylim(ylim)
         plt.grid(True, which='both', linestyle='--', alpha=0.3)
-        plt.legend(fontsize=fs_legend)
+        if legend:
+            plt.legend(fontsize=fs_legend)
         plt.tight_layout()
         plt.show()
 
@@ -256,7 +265,8 @@ class MultiFractality:
 
 
 
-    def plot_fit_hq(self, q=None, correction=1.0, fs_legend=10, cmap_name='tab20', **kwargs):
+    def plot_fit_hq(self, q=None, correction=1.0, fs_legend=10,
+                    legend=True, cmap_name='tab20', **kwargs):
         """
         Plotea F_q(s) vs s y su ajuste para uno o varios valores de q ajustados anteriormente.
 
@@ -307,17 +317,18 @@ class MultiFractality:
         plt.yscale('log')
         plt.xlabel(r"$s$")
         plt.ylabel(r"$F_q(s)$")
-        plt.legend(fontsize=fs_legend)
+        if legend:
+            plt.legend(fontsize=fs_legend)
         plt.grid(True, which='both', linestyle='--', alpha=0.3)
         plt.tight_layout()
         plt.show()
 
 
 
-    def plot_hq_vs_q(self, marker='o', color='tab:blue', fs_labels=12,
-                fs_legend=10, interpolate=None, interpolation_marker='-',
+    def plot_hq(self, marker='o', color='tab:blue', fs_labels=12,
+                fs_legend=10, interpolate_method=None, interpolate_marker='-',
                 poly_degree=3, num_points=300, ms_interpolate=5,
-                spline_smooth=0.5, interp_kind='cubic', **kwargs):
+                spline_smooth=0.5, interpolate_order='cubic', **kwargs):
         """
         Grafica h(q) vs q con opción de interpolar la curva.
 
@@ -347,24 +358,37 @@ class MultiFractality:
                     color=color, capsize=3, label=r"$h(q)$")
 
         # Choosing interpolation method
-        if interpolate is not None and len(qs) >= 4:
+        if interpolate_method is not None and len(qs) >= 4:
             q_dense = np.linspace(min(qs), max(qs), num=num_points)
 
-            if interpolate == "polynomial" and len(qs) > poly_degree:
+            if interpolate_method == "polynomial" and len(qs) > poly_degree:
                 coeffs = np.polyfit(qs, hqs, deg=poly_degree)
                 poly = np.poly1d(coeffs)
                 hq_dense = poly(q_dense)
                 label_interp = fr"Polynomial deg {poly_degree}"
 
-            elif interpolate == "splines":
+            elif interpolate_method == "splines":
                 spline = UnivariateSpline(qs, hqs, s=spline_smooth)
                 hq_dense = spline(q_dense)
                 label_interp = fr"Spline smooth {spline_smooth}"
 
-            elif interpolate == "interp1d":
-                interp_func = interp1d(qs, hqs, kind=interp_kind)
+            elif interpolate_method == "interp1d":
+                interp_func = interp1d(qs, hqs, kind=interpolate_order)
                 hq_dense = interp_func(q_dense)
-                label_interp = fr"interp1d kind '{interp_kind}'"
+                label_interp = fr"interp1d kind '{interpolate_order}'"
+
+            elif interpolate_method == "arccot":
+                try:
+                    # Estimar parámetros iniciales
+                    A0 = 1
+                    B0 = -1
+                    C0 = 1
+                    D0 = 0
+                    popt, _ = curve_fit(arccot, qs, hqs, p0=[A0, B0, C0, D0], maxfev=10000)
+                    hq_dense = arccot(q_dense, *popt)
+                    label_interp = r"Cotangent fit"
+                except RuntimeError:
+                    raise RuntimeError("No se pudo ajustar la función cotangente. Intenta con otro método o revisa los datos.")
 
             else:
                 raise ValueError("Interpolación inválida o insuficientes puntos.")
@@ -373,7 +397,7 @@ class MultiFractality:
             self.hq_dense = hq_dense
 
             # Plot interpolación
-            plt.plot(q_dense, hq_dense, interpolation_marker, color='black',
+            plt.plot(self.q_dense, self.hq_dense, interpolate_marker, color='black',
                     alpha=0.7, markersize=ms_interpolate, label=label_interp)
 
         plt.xlabel(r"$q$", fontsize=fs_labels)
@@ -396,7 +420,7 @@ class MultiFractality:
         - tau: array con tau(q)
         """
         assert hasattr(self, "hq_dense") and hasattr(self, "q_dense"), \
-            "Debes ejecutar plot_hq_vs_q antes de calcular tau(q)"
+            "Debes ejecutar plot_hq en modo interpolación antes de calcular tau(q)"
 
         self.tau = self.hq_dense * self.q_dense - 1
 
@@ -419,7 +443,7 @@ class MultiFractality:
             return self.q_dense, self.tau
 
 
-    def compute_singularity_spectrum(self, plot=False, **kwargs):
+    def compute_singularity_spectrum(self, plot=False, output_range=[None, None], **kwargs):
         """
         Calcula el espectro de singularidades f(α) vs α a partir de τ(q).
 
@@ -445,12 +469,12 @@ class MultiFractality:
         f_alpha = self.q_dense * alpha - self.tau
 
         # Guardar en self
-        self.alpha = alpha
-        self.f_alpha = f_alpha
+        self.alpha = alpha[output_range[0]:output_range[1]]
+        self.f_alpha = f_alpha[output_range[0]:output_range[1]]
 
         if plot:
             plt.figure(dpi=kwargs.pop('dpi', 200))
-            plt.plot(alpha, f_alpha,
+            plt.plot(self.alpha, self.f_alpha,
                     marker=kwargs.pop('marker', 'o'),
                     linestyle=kwargs.pop('linestyle', '-'),
                     color=kwargs.pop('color', 'tab:purple'),
@@ -464,7 +488,7 @@ class MultiFractality:
             plt.show()
 
         else:
-            return alpha, f_alpha
+            return self.alpha, self.f_alpha
 
 
     def compute_Dq(self, method_q1='interp', plot=False, **kwargs):

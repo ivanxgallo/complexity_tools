@@ -51,7 +51,7 @@ def _vg_visible_edges(i, series):
 def compare_degree_distributions(vg_list, kind='total', labels=None,
                                 colors=None, markers=None, linestyles=None,
                                 fit_linestyle='--', fit_color='black',
-                                fit_range=None, dpi=200, figsize=(8, 6)):
+                                fit_range=None, dpi=200, figsize=(8, 6), **kwargs):
     """
     Compara las distribuciones de conectividad y sus ajustes para múltiples objetos VG.
 
@@ -113,9 +113,11 @@ def compare_degree_distributions(vg_list, kind='total', labels=None,
 
             plt.plot(k_fit, pk_fit, linestyle=fit_linestyle, color=fit_color, label=fit_label)
 
-    plt.xlabel(r"$k$")
-    plt.ylabel(r"$P(k)$")
+    plt.xlabel(r"$k$", fontsize=kwargs.pop("fs_labels", 15))
+    plt.ylabel(r"$P(k)$", fontsize=kwargs.pop("fs_labels", 15))
     plt.yscale('log')
+    plt.xticks(fontsize=kwargs.pop('xticksize', None))
+    plt.yticks(fontsize=kwargs.pop('yticksize', None))
     plt.legend()
     plt.grid(True, which='both', linestyle='--', alpha=0.4)
     plt.tight_layout()
