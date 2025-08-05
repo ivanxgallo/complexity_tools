@@ -26,11 +26,11 @@ class PointProcessNetwork:
         self.events = df[[time_col] + space_cols].sort_values(by=time_col).reset_index(drop=True)
 
 
-    def load_events_from_csv(self, filepath, time_col='t', space_cols=None):
+    def load_events_from_csv(self, filepath, time_col='t', space_cols=None, sep=" "):
         """
         Carga eventos desde un archivo CSV.
         """
-        df = pd.read_csv(filepath)
+        df = pd.read_csv(filepath, sep=sep)
         self.load_events_from_df(df, time_col, space_cols)
 
 
@@ -104,15 +104,16 @@ class PointProcessNetwork:
         self.graph.remove_nodes_from(nodes_to_remove)
 
 
-    def connectivity_count(self, kind='total'):
+    def connectivity_count(self, kind='total', return_prob=False):
         """
-        Retorna un diccionario que indica cuántos nodos tienen cada grado de conectividad.
+        Retorna listas de grados y cuentas, y opcionalmente P(k).
 
         Parámetros:
-        - kind: 'total' (grado total), 'in' (grado de entrada), 'out' (grado de salida)
+        - kind: 'total', 'in', 'out'
+        - return_prob: si True, también retorna P(k)
 
         Retorna:
-        - dict: {grado: cantidad de nodos con ese grado}
+        - grados, cuentas [, pk]
         """
         if kind == 'total':
             degrees = [deg for _, deg in self.graph.degree()]
@@ -125,12 +126,16 @@ class PointProcessNetwork:
         else:
             raise ValueError("Parámetro 'kind' debe ser 'total', 'in' o 'out'")
 
-
         count = Counter(degrees)
         max_degree = max(count.keys())
 
         degree_list = list(range(1, max_degree + 1))
         count_list = [count.get(g, 0) for g in degree_list]
+
+        if return_prob:
+            total_nodes = sum(count_list)
+            pk_list = [c / total_nodes for c in count_list]
+            return degree_list, pk_list
 
         return degree_list, count_list
 
@@ -193,19 +198,81 @@ class PointProcessNetwork:
         plt.show()
 
 
+    def get_graph_stats(self):
+        stats = {
+            'n_nodes': self.graph.number_of_nodes(),
+            'n_edges': self.graph.number_of_edges(),
+            'density': nx.density(self.graph),
+            'k_avg': np.mean([d for _, d in self.graph.degree()]) if self.graph.number_of_nodes() > 0 else 0,
+        }
+
+        # --- Clustering global ---
+        try:
+            if self.graph.is_directed():
+                # Para grafos dirigidos se convierte a no dirigido
+                G_undirected = self.graph.to_undirected()
+                stats['clustering'] = nx.average_clustering(G_undirected)
+            else:
+                stats['clustering'] = nx.average_clustering(self.graph)
+        except Exception as e:
+            stats['clustering'] = None
+            print(f"[WARN] Error computing clustering: {e}")
+
+        # --- Entropía de conectividad ---
+        try:
+            _, pk = self.connectivity_count(return_prob=True)
+            entropy = -sum(p * np.log(p) for p in pk if p > 0)
+            stats['entropy'] = entropy
+        except Exception as e:
+            stats['entropy'] = None
+            print(f"[WARN] Error computing entropy: {e}")
+
+        self.stats = stats
+
+        return stats
+
+
 
 class EvolvingNetwork:
-    def __init__(self, point_process_df, time_col='t', space_cols=None, dim=2, directed=False):
+    def __init__(self, point_process_df, time_col='t', space_cols=None,
+                    dim=2, directed=False, timestamp_method='mean'):
         self.df = point_process_df.sort_values(by=time_col).reset_index(drop=True)
+        point_process_df[time_col] = pd.to_datetime(point_process_df[time_col])
         self.time_col = time_col
         self.space_cols = space_cols
         self.dim = dim
         self.directed = directed
-        self.snapshots = []  # Lista de tuplas (timestamp, PointProcessNetwork)
-        self.stats = []      # Lista de dicts con stats globales por snapshot
+        self.timestamp_method = timestamp_method
+        self.time = []
+        self.stats = []
 
 
-    def build_by_time_window(self, window_size, step_size, cell_size=1.0):
+    def _compute_timestamp(self, series):
+        """
+        Retorna un timestamp representativo de la serie según el método definido.
+
+        Parámetros:
+        - series: columna de tiempo de una ventana (tipo pd.Series)
+
+        Retorna:
+        - Timestamp
+        """
+        method = self.timestamp_method
+        if method == 'mean':
+            return series.mean()
+        elif method == 'median':
+            return series.median()
+        elif method == 'min':
+            return series.min()
+        elif method == 'max':
+            return series.max()
+        elif method in ('mid', 'center'):
+            return series.min() + (series.max() - series.min()) / 2
+        else:
+            raise ValueError(f"timestamp_method '{method}' no reconocido. Usa: 'mean', 'median', 'min' o 'max'.")
+
+
+    def build_by_time_window(self, window_size, step_size, cell_size=0.1):
         """
         Parámetros:
         - window_size: timedelta o float (segundos)
@@ -222,15 +289,15 @@ class EvolvingNetwork:
             if len(window_df) == 0:
                 current += step_size
                 continue
-            timestamp = window_df[self.time_col].mean()
+            timestamp = self._compute_timestamp(window_df[self.time_col])
 
             ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
             ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
             ppn.create_grid(cell_size)
             ppn.build_sequential_graph()
 
-            self.snapshots.append((timestamp, ppn))
-            self.stats.append(self._get_graph_stats(ppn.graph))
+            self.time.append(timestamp)
+            self.stats.append(ppn.get_graph_stats())
 
             current += step_size
 
@@ -239,15 +306,15 @@ class EvolvingNetwork:
         for start in range(0, len(self.df) - window_size + 1, step):
             end = start + window_size
             window_df = self.df.iloc[start:end]
-            timestamp = window_df[self.time_col].mean()
+            timestamp = self._compute_timestamp(window_df[self.time_col])
 
             ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
             ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
             ppn.create_grid(cell_size)
             ppn.build_sequential_graph()
 
-            self.snapshots.append((timestamp, ppn))
-            self.stats.append(self._get_graph_stats(ppn.graph))
+            self.time.append(timestamp)
+            self.stats.append(ppn.get_graph_stats())
 
 
     def do_evolution(self, method="event", **kwargs):
@@ -266,17 +333,8 @@ class EvolvingNetwork:
             raise ValueError("Method must be 'event' or 'time'")
 
 
-    def _get_graph_stats(self, G):
-        return {
-            'n_nodes': G.number_of_nodes(),
-            'n_edges': G.number_of_edges(),
-            'density': nx.density(G),
-            'k_avg': np.mean([d for n, d in G.degree()]) if G.number_of_nodes() > 0 else 0,
-        }
-
-
     def plot_stat(self, stat_name, **kwargs):
-        times = [t for t, _ in self.snapshots]
+        times = self.time
         values = [s[stat_name] for s in self.stats]
         plt.figure(dpi=200)
         plt.plot(times, values, marker='o')
@@ -286,6 +344,61 @@ class EvolvingNetwork:
         plt.grid(True)
         plt.tight_layout()
         plt.show()
+
+    def plot_all_stats(self, last=None, figsize=(10, 15), dpi=200, x_rotation=45, font_size=18):
+        """
+        Plotea todas las métricas principales de la evolución de la red en subplots separados.
+
+        Parámetros:
+        - last: si es un entero negativo, selecciona los últimos N puntos. Si None, usa todo.
+        - figsize: tamaño de la figura
+        - dpi: resolución del gráfico
+        - x_rotation: rotación de etiquetas en el eje X
+        - font_size: tamaño base de etiquetas
+        """
+
+        # --- Preparar series temporales ---
+        if last is not None:
+            times = self.time[:last]
+            stats = self.stats[:last]
+        else:
+            times = self.time
+            stats = self.stats
+
+        # Extraer series
+        n_nodes   = [s['n_nodes'] for s in stats]
+        n_edges   = [s['n_edges'] for s in stats]
+        density   = [s['density'] for s in stats]
+        k_mean    = [s['k_avg'] for s in stats]
+        clustering = [s['clustering'] for s in stats]
+        entropy   = [s['entropy'] for s in stats]
+
+        # Definir métricas a graficar
+        metrics = {
+            r"$N$": n_nodes,
+            r"$E$": n_edges,
+            r"$\rho/\rho_{max}$": np.array(density) / max(density) if max(density) > 0 else density,
+            r"$\langle k \rangle$": k_mean,
+            r"$C/C_{max}$": np.array(clustering) / max(clustering) if max(clustering) > 0 else clustering,
+            r"$S$": entropy,
+        }
+
+        # Crear figura
+        fig, axes = plt.subplots(nrows=len(metrics), figsize=figsize, sharex=True, dpi=dpi)
+
+        for ax, (name, values) in zip(axes, metrics.items()):
+            ax.plot(times, values, marker='.', linestyle='-', color='black')
+            ax.set_ylabel(name, fontsize=font_size)
+            ax.grid(True)
+            ax.tick_params(axis="y", labelsize=font_size - 4)
+
+        # Formato eje X
+        axes[-1].set_xlabel("Time", fontsize=font_size)
+        plt.xticks(rotation=x_rotation, fontsize=font_size - 2)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.98])
+        plt.show()
+
 
 
 
