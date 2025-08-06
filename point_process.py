@@ -85,12 +85,12 @@ class PointProcessNetwork:
         """
         coords = self.events.iloc[:, 1:].values
         prev_cell = None
-        for x in coords:
+        for x in tqdm(coords, leave=False, desc="Build a Graph"):
             cell = self.locate_event_cell(x)
             if cell not in self.graph:
                 # Calcular centro de la celda
                 center = []
-                for i, idx in enumerate(tqdm(cell)):
+                for i, idx in enumerate(cell):
                     edge_start = self.grid['edges'][i][idx]
                     edge_end = self.grid['edges'][i][idx + 1]
                     center.append(0.5 * (edge_start + edge_end))
@@ -236,8 +236,22 @@ class PointProcessNetwork:
 class EvolvingNetwork:
     def __init__(self, point_process_df, time_col='t', space_cols=None,
                     dim=2, directed=False, timestamp_method='mean'):
-        self.df = point_process_df.sort_values(by=time_col).reset_index(drop=True)
+        # --- Normalización de space_cols ---
+        if space_cols is None:
+            space_cols = [col for col in point_process_df.columns if col != time_col]
+        elif isinstance(space_cols, str):
+            space_cols = [space_cols]  # caso dim = 1
+
+        # --- Validación ---
+        assert isinstance(space_cols, (list, tuple)), "'space_cols' must be string, list or tuple"
+        assert all(isinstance(col, str) for col in space_cols), "All elements of 'space_cols' must bestrings"
+        assert len(space_cols) == dim, f"It is expected {dim} spatial columns, but {len(space_cols)} are given."
+
+        # --- Selección de columnas ---
+        cols = [time_col] + list(space_cols)
+        point_process_df = point_process_df[cols].copy()
         point_process_df[time_col] = pd.to_datetime(point_process_df[time_col])
+        self.df = point_process_df.sort_values(by=time_col).reset_index(drop=True)
         self.time_col = time_col
         self.space_cols = space_cols
         self.dim = dim
@@ -272,38 +286,54 @@ class EvolvingNetwork:
             raise ValueError(f"timestamp_method '{method}' no reconocido. Usa: 'mean', 'median', 'min' o 'max'.")
 
 
-    def build_by_time_window(self, window_size, step_size, cell_size=0.1):
+    def build_by_time_window(self, window_size, step_size, cell_size=0.01):
         """
+        Divide el dataset en ventanas de tiempo deslizantes, construyendo grafos secuenciales.
+
         Parámetros:
-        - window_size: timedelta o float (segundos)
-        - step_size: timedelta o float (segundos)
+        - window_size: pd.Timedelta, str o np.timedelta64. Duración de cada ventana.
+        - step_size: pd.Timedelta, str o np.timedelta64. Paso con que se desliza la ventana.
+        - cell_size: tamaño de la celda para discretizar el espacio.
         """
+        # Convertir a pd.Timedelta si vienen como strings o floats
+        window_size = pd.to_timedelta(window_size)
+        step_size = pd.to_timedelta(step_size)
+
         t_values = pd.to_datetime(self.df[self.time_col])
         t_start = t_values.min()
         t_end = t_values.max()
 
+        total_steps = int((t_end - t_start - window_size) / step_size) + 1
         current = t_start
-        while current + window_size <= t_end:
+
+        for _ in tqdm(range(total_steps), desc="Evolving Network by Time Window"):
             mask = (t_values >= current) & (t_values < current + window_size)
             window_df = self.df[mask]
+            current += step_size  # avanzar paso al principio para no olvidar
+
             if len(window_df) == 0:
-                current += step_size
                 continue
-            timestamp = self._compute_timestamp(window_df[self.time_col])
 
-            ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
-            ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
-            ppn.create_grid(cell_size)
-            ppn.build_sequential_graph()
+            try:
+                timestamp = self._compute_timestamp(window_df[self.time_col])
 
-            self.time.append(timestamp)
-            self.stats.append(ppn.get_graph_stats())
+                ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
+                ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
+                ppn.create_grid(cell_size)
+                ppn.build_sequential_graph()
 
-            current += step_size
+                self.time.append(timestamp)
+                self.stats.append(ppn.get_graph_stats())
+
+            except Exception as e:
+                print(f"[WARN] Se omite ventana en {timestamp} (error: {type(e).__name__} - {e})")
+                continue
 
 
-    def build_by_event_window(self, window_size=1000, step=200, cell_size=1.0):
-        for start in range(0, len(self.df) - window_size + 1, step):
+
+
+    def build_by_event_window(self, window_size=1000, step_size=200, cell_size=0.01):
+        for start in tqdm(range(0, len(self.df) - window_size + 1, step_size), desc="Evolving Network by Event Window"):
             end = start + window_size
             window_df = self.df.iloc[start:end]
             timestamp = self._compute_timestamp(window_df[self.time_col])
@@ -325,6 +355,10 @@ class EvolvingNetwork:
         - method: "event" o "time"
         - kwargs: parámetros para pasar al método correspondiente
         """
+
+        self.time = []
+        self.stats = []
+
         if method == "event":
             self.build_by_event_window(**kwargs)
         elif method == "time":
