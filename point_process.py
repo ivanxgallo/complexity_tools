@@ -6,6 +6,14 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from collections import Counter
 from tqdm.notebook import tqdm
+import os, tempfile, shutil
+import imageio.v2 as imageio
+try:
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+    _HAS_CARTOPY = True
+except Exception:
+    _HAS_CARTOPY = False
 
 
 class PointProcessNetwork:
@@ -232,10 +240,125 @@ class PointProcessNetwork:
         return stats
 
 
+    def plot_on_map(self, ax=None, *,
+                    degree_weight=True,
+                    base_size=2.0,
+                    size_per_degree=1.0,
+                    edge_width=0.3,
+                    edge_alpha=0.25,
+                    node_edgecolor='black',
+                    node_facecolor='red',
+                    contour_width=0.4,
+                    add_features=True,
+                    extent='auto',
+                    extent_margin=(1.0, 0.25),
+                    cities=None,
+                    city_size=70,
+                    city_color="gold",
+                    city_textsize=12,
+                    savepath=None,
+                    dpi=200, figsize=(6, 6),
+                    show=True):
+        """
+        Dibuja el grafo sobre un mapa (lon, lat) usando las posiciones 'pos' de los nodos
+        (asumidas como (lon, lat)). Requiere Cartopy.
+
+        - extent: 'auto' | tuple (min_lon, max_lon, min_lat, max_lat) | None
+        """
+        if not _HAS_CARTOPY:
+            raise ImportError("Cartopy is not installed. Use `pip install cartopy`")
+
+        # Crear figura/ax con proyección si no viene uno
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()},
+                                    dpi=dpi, figsize=figsize)
+            created_fig = True
+
+        # Posiciones de nodos (lon, lat) guardadas en 'pos'
+        pos = nx.get_node_attributes(self.graph, 'pos')
+        if not pos:
+            raise ValueError("No hay posiciones 'pos' en los nodos. ¿Llamaste a build_sequential_graph()?")
+
+        # Extent automático
+        if extent == 'auto':
+            lons = [p[0] for p in pos.values()]
+            lats = [p[1] for p in pos.values()]
+            if len(lons) == 0:
+                raise ValueError("No hay nodos para determinar extent.")
+            dx, dy = extent_margin
+            extent = (min(lons) - dx, max(lons) + dx, min(lats) - dy, max(lats) + dy)
+
+        # Configurar límites
+        if extent is not None:
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+
+        # Features base
+        if add_features:
+            ax.add_feature(cfeature.COASTLINE, linewidth=1)
+            ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5)
+            ax.add_feature(cfeature.LAND, facecolor='lightgray')
+            ax.add_feature(cfeature.OCEAN, facecolor='lightblue')
+            gl = ax.gridlines(draw_labels=True, color="gray", alpha=0.5, linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+
+        # Nodos conectados (grado > 0)
+        connected = [(n, d) for n, d in self.graph.degree() if d > 0]
+
+        # Dibujar edges primero (debajo)
+        for u, v in self.graph.edges():
+            lon_u, lat_u = pos[u]
+            lon_v, lat_v = pos[v]
+            ax.plot([lon_u, lon_v], [lat_u, lat_v],
+                    transform=ccrs.PlateCarree(),
+                    linewidth=edge_width,
+                    color='black',
+                    alpha=edge_alpha,
+                    zorder=4)
+
+        # Dibujar nodos
+        for n, deg in connected:
+            lon, lat = pos[n]
+            size = base_size + (deg * size_per_degree if degree_weight else 0.0)
+            ax.scatter(lon, lat,
+                        transform=ccrs.PlateCarree(),
+                        s=size,
+                        color=node_facecolor,
+                        edgecolor=node_edgecolor,
+                        linewidths=contour_width,
+                        zorder=5)
+
+        # Ciudades opcionales
+        if cities:
+            for city in cities:
+                ax.scatter(city["lon"], city["lat"],
+                            s=city_size,
+                            color=city_color,
+                            edgecolor="black",
+                            transform=ccrs.PlateCarree(),
+                            zorder=6)
+                tx_lon, tx_lat = city["text_position"]
+                ax.text(tx_lon, tx_lat, city["name"],
+                        fontsize=city_textsize, fontweight='bold', color="black",
+                        ha="right", va="center",
+                        transform=ccrs.PlateCarree(),
+                        zorder=10)
+
+        if savepath:
+            plt.tight_layout()
+            plt.savefig(savepath, bbox_inches="tight", dpi=dpi)
+
+        if created_fig and show:
+            plt.show()
+
+        return ax
+
+
 
 class EvolvingNetwork:
     def __init__(self, point_process_df, time_col='t', space_cols=None,
-                    dim=2, directed=False, timestamp_method='mean'):
+                    dim=2, directed=False, timestamp_method='mean', save_graphs=False):
         # --- Normalización de space_cols ---
         if space_cols is None:
             space_cols = [col for col in point_process_df.columns if col != time_col]
@@ -259,6 +382,8 @@ class EvolvingNetwork:
         self.timestamp_method = timestamp_method
         self.time = []
         self.stats = []
+        self.graphs = []
+        self.save_graph = save_graphs
 
 
     def _compute_timestamp(self, series):
@@ -324,12 +449,12 @@ class EvolvingNetwork:
 
                 self.time.append(timestamp)
                 self.stats.append(ppn.get_graph_stats())
+                if self.save_graph:
+                    self.graphs.append(ppn.graph)
 
             except Exception as e:
                 print(f"[WARN] Se omite ventana en {timestamp} (error: {type(e).__name__} - {e})")
                 continue
-
-
 
 
     def build_by_event_window(self, window_size=1000, step_size=200, cell_size=0.01):
@@ -346,6 +471,9 @@ class EvolvingNetwork:
             self.time.append(timestamp)
             self.stats.append(ppn.get_graph_stats())
 
+            if self.save_graph:
+                    self.graphs.append(ppn.graph)
+
 
     def do_evolution(self, method="event", **kwargs):
         """
@@ -358,6 +486,7 @@ class EvolvingNetwork:
 
         self.time = []
         self.stats = []
+        self.graphs = []
 
         if method == "event":
             self.build_by_event_window(**kwargs)
@@ -378,6 +507,7 @@ class EvolvingNetwork:
         plt.grid(True)
         plt.tight_layout()
         plt.show()
+
 
     def plot_all_stats(self, last=None, figsize=(10, 15), dpi=200, x_rotation=45, font_size=18):
         """
@@ -432,6 +562,141 @@ class EvolvingNetwork:
 
         plt.tight_layout(rect=[0, 0, 1, 0.98])
         plt.show()
+
+
+    def make_map_gif(self, out_path, *,
+                    fps=4,
+                    cities=None,
+                    extent="auto_union",      # 'auto' | 'auto_union' | tuple(min_lon,max_lon,min_lat,max_lat) | None
+                    extent_margin=(1.0, 0.25),
+                    annotate_time=True,
+                    time_fmt="%Y-%m-%d",
+                    time_loc="ul",            # 'ul','ur','ll','lr'
+                    time_fontsize=12,
+                    time_box=True,
+                    dpi=200, figsize=(6, 6),
+                    # Parámetros que se pasan a plot_on_map:
+                    degree_weight=True,
+                    base_size=2.0,
+                    size_per_degree=1.0,
+                    edge_width=0.3,
+                    edge_alpha=0.25,
+                    node_edgecolor='black',
+                    node_facecolor='red',
+                    contour_width=0.4,
+                    add_features=True,
+                    show=False):
+        """
+        Genera un GIF con los snapshots guardados en self.graphs dibujados sobre mapa.
+        Requiere EvolvingNetwork(..., save_graphs=True) y do_evolution() ya ejecutado.
+
+        - extent:
+            'auto_union': usa bounding box global de todos los snapshots (recomendado)
+            'auto': cada frame autoajusta su extent (puede "temblar")
+            tuple: (min_lon, max_lon, min_lat, max_lat)
+            None: no fija extent
+        - annotate_time: si True, escribe self.time[idx] en cada frame
+        - time_loc: esquina ('ul' arriba-izq, 'ur' arriba-der, 'll' abajo-izq, 'lr' abajo-der)
+        """
+        if not self.save_graph:
+            raise ValueError("No graphs saved. Initialize with save_graphs=True and execute do_evolution().")
+        if len(self.graphs) == 0:
+            raise ValueError("self.graphs is empty. Did you execute do_evolution()?")
+
+        # --- Calcular extent fijo si se pide 'auto_union' ---
+        fixed_extent = None
+        if extent == "auto_union":
+            all_lons, all_lats = [], []
+            for G in self.graphs:
+                pos = nx.get_node_attributes(G, 'pos')
+                if not pos:
+                    continue
+                lons = [p[0] for p in pos.values()]
+                lats = [p[1] for p in pos.values()]
+                all_lons.extend(lons)
+                all_lats.extend(lats)
+            if len(all_lons) == 0:
+                raise ValueError("No hay posiciones 'pos' en los nodos de los snapshots.")
+            dx, dy = extent_margin
+            fixed_extent = (min(all_lons) - dx, max(all_lons) + dx, min(all_lats) - dy, max(all_lats) + dy)
+        elif isinstance(extent, tuple):
+            fixed_extent = extent
+        elif extent in ("auto", None):
+            fixed_extent = extent
+        else:
+            raise ValueError("Parametro 'extent' inválido. Usa 'auto_union', 'auto', tuple o None.")
+
+        # --- Carpeta temporal para frames ---
+        tmpdir = tempfile.mkdtemp(prefix="mapgif_")
+        frame_paths = []
+
+        try:
+            from tqdm.auto import tqdm as _tqdm
+            for idx, G in enumerate(_tqdm(self.graphs, desc="Rendering GIF frames")):
+                # dummy PPN para reutilizar plot_on_map
+                ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
+                ppn.graph = G
+
+                # Dibujar frame
+                ax = ppn.plot_on_map(
+                    ax=None,
+                    degree_weight=degree_weight,
+                    base_size=base_size,
+                    size_per_degree=size_per_degree,
+                    edge_width=edge_width,
+                    edge_alpha=edge_alpha,
+                    node_edgecolor=node_edgecolor,
+                    node_facecolor=node_facecolor,
+                    contour_width=contour_width,
+                    add_features=add_features,
+                    extent=fixed_extent if fixed_extent is not None else 'auto',
+                    extent_margin=extent_margin,
+                    cities=cities,
+                    dpi=dpi, figsize=figsize,
+                    show=show
+                )
+
+                # --- Timestamp en el frame ---
+                if annotate_time and idx < len(self.time):
+                    ts = self.time[idx]
+                    try:
+                        label = ts.strftime(time_fmt)
+                    except Exception:
+                        label = str(ts)
+
+                    # Coordenadas en el sistema del eje (0..1), no dependen del extent
+                    locs = {
+                        "ul": (0.02, 0.98, "left",  "top"),
+                        "ur": (0.98, 0.98, "right", "top"),
+                        "ll": (0.02, 0.02, "left",  "bottom"),
+                        "lr": (0.98, 0.02, "right", "bottom"),
+                    }
+                    x, y, ha, va = locs.get(time_loc, locs["ul"])
+                    bbox = dict(facecolor='white', alpha=0.65, edgecolor='none', pad=2) if time_box else None
+
+                    ax.text(x, y, label,
+                            transform=ax.transAxes,
+                            fontsize=time_fontsize,
+                            fontweight='bold',
+                            ha=ha, va=va,
+                            bbox=bbox)
+
+                # Guardar frame
+                frame_path = os.path.join(tmpdir, f"frame_{idx:04d}.png")
+                plt.savefig(frame_path, bbox_inches="tight", dpi=dpi)
+                plt.close()
+                frame_paths.append(frame_path)
+
+            # --- Escribir GIF ---
+            images = [imageio.imread(p) for p in frame_paths]
+            duration = 1.0 / float(fps)
+            imageio.mimsave(out_path, images, duration=duration)
+
+        finally:
+            # Limpiar temporales
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        return out_path
 
 
 
