@@ -5,15 +5,73 @@ import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
 from collections import Counter
-from tqdm.notebook import tqdm
+from tqdm.auto import tqdm
 import os, tempfile, shutil
 import imageio.v2 as imageio
+import imageio.v3 as iio
+from PIL import Image
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
     _HAS_CARTOPY = True
 except Exception:
     _HAS_CARTOPY = False
+
+
+# Worker para un frame (nivel de módulo)
+def _render_map_frame(task):
+    """
+    task: dict con:
+    - idx, graph, time_label (str o None), out_path (png)
+    - plot kwargs: degree_weight, base_size, size_per_degree, ...
+    - extent, extent_margin, cities, dpi, figsize, time_loc, time_fontsize, time_box
+    """
+    # Reutilizar tu PPN
+    ppn = PointProcessNetwork(dim=task.get("dim", 2), directed=task.get("directed", False))
+    ppn.graph = task["graph"]
+
+    # Dibujar
+    ax = ppn.plot_on_map(
+        ax=None,
+        degree_weight=task["degree_weight"],
+        base_size=task["base_size"],
+        size_per_degree=task["size_per_degree"],
+        edge_width=task["edge_width"],
+        edge_alpha=task["edge_alpha"],
+        node_edgecolor=task["node_edgecolor"],
+        node_facecolor=task["node_facecolor"],
+        contour_width=task["contour_width"],
+        add_features=task["add_features"],
+        extent=task["extent"],
+        extent_margin=task["extent_margin"],
+        cities=task["cities"],
+        dpi=task["dpi"],
+        figsize=task["figsize"],
+        show=False
+    )
+
+    # Timestamp en el frame (opcional)
+    label = task.get("time_label", None)
+    if label:
+        locs = {
+            "ul": (0.02, 0.98, "left",  "top"),
+            "ur": (0.98, 0.98, "right", "top"),
+            "ll": (0.02, 0.02, "left",  "bottom"),
+            "lr": (0.98, 0.02, "right", "bottom"),
+        }
+        x, y, ha, va = locs.get(task["time_loc"], (0.02, 0.98, "left", "top"))
+        bbox = dict(facecolor='white', alpha=0.65, edgecolor='none', pad=2) if task["time_box"] else None
+        ax.text(x, y, label, transform=ax.transAxes,
+                fontsize=task["time_fontsize"], fontweight='bold', ha=ha, va=va, bbox=bbox)
+
+    # Guardar SIEMPRE con la figura del eje
+    fig = ax.figure
+    fig.savefig(task["out_path"], dpi=task["dpi"], bbox_inches='tight')  # sin bbox_inches='tight' para tamaño consistente
+    plt.close(fig)
+    return task["out_path"]
+
 
 
 class PointProcessNetwork:
@@ -585,7 +643,8 @@ class EvolvingNetwork:
                     node_facecolor='red',
                     contour_width=0.4,
                     add_features=True,
-                    show=False):
+                    show=False,
+                    loop=0):
         """
         Genera un GIF con los snapshots guardados en self.graphs dibujados sobre mapa.
         Requiere EvolvingNetwork(..., save_graphs=True) y do_evolution() ya ejecutado.
@@ -631,8 +690,7 @@ class EvolvingNetwork:
         frame_paths = []
 
         try:
-            from tqdm.auto import tqdm as _tqdm
-            for idx, G in enumerate(_tqdm(self.graphs, desc="Rendering GIF frames")):
+            for idx, G in enumerate(tqdm(self.graphs, desc="Rendering GIF frames")):
                 # dummy PPN para reutilizar plot_on_map
                 ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
                 ppn.graph = G
@@ -690,13 +748,269 @@ class EvolvingNetwork:
             # --- Escribir GIF ---
             images = [imageio.imread(p) for p in frame_paths]
             duration = 1.0 / float(fps)
-            imageio.mimsave(out_path, images, duration=duration)
+            imageio.mimsave(out_path, images, duration=duration, loop=loop)
 
         finally:
             # Limpiar temporales
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         return out_path
+
+
+    def make_map_gif_fast(self, out_path, *,
+                    duration=4,
+                    cities=None,
+                    extent="auto_union",
+                    extent_margin=(1.0, 0.25),
+                    annotate_time=True,
+                    time_fmt="%Y-%m-%d",
+                    time_loc="ul",
+                    time_fontsize=12,
+                    time_box=True,
+                    dpi=200, figsize=(6, 6),
+                    # Parámetros de plot_on_map:
+                    degree_weight=True,
+                    base_size=2.0,
+                    size_per_degree=1.0,
+                    edge_width=0.3,
+                    edge_alpha=0.25,
+                    node_edgecolor='black',
+                    node_facecolor='red',
+                    contour_width=0.4,
+                    add_features=True,
+                    show=False,
+                    loop=0,
+                    n_jobs=1,              # <--- NUEVO: # procesos (1 = serial)
+                    max_side=None):        # opcional: reescalar frames para GIF
+        import tempfile, shutil
+        if not self.save_graph:
+            raise ValueError("No graphs saved. Initialize with save_graphs=True and execute do_evolution().")
+        if len(self.graphs) == 0:
+            raise ValueError("self.graphs is empty. Did you execute do_evolution()?")
+
+        # ----- extent fijo (opcional) -----
+        fixed_extent = None
+        if extent == "auto_union":
+            all_lons, all_lats = [], []
+            for G in self.graphs:
+                pos = nx.get_node_attributes(G, 'pos')
+                if not pos:
+                    continue
+                lons = [p[0] for p in pos.values()]
+                lats = [p[1] for p in pos.values()]
+                all_lons.extend(lons); all_lats.extend(lats)
+            if not all_lons:
+                raise ValueError("No node 'pos' found to determine global extent.")
+            dx, dy = extent_margin
+            fixed_extent = (min(all_lons)-dx, max(all_lons)+dx, min(all_lats)-dy, max(all_lats)+dy)
+        elif isinstance(extent, tuple) or extent in ("auto", None):
+            fixed_extent = extent
+        else:
+            raise ValueError("Invalid 'extent'. Use 'auto_union', 'auto', tuple or None.")
+
+        # ----- carpeta temporal -----
+        tmpdir = tempfile.mkdtemp(prefix="mapgif_")
+        frame_paths = [os.path.join(tmpdir, f"frame_{i:04d}.png") for i in range(len(self.graphs))]
+
+        # Prepara tareas
+        tasks = []
+        for idx, G in enumerate(self.graphs):
+            time_label = None
+            if annotate_time and idx < len(self.time):
+                ts = self.time[idx]
+                try:
+                    time_label = ts.strftime(time_fmt)
+                except Exception:
+                    time_label = str(ts)
+
+            tasks.append(dict(
+                idx=idx,
+                graph=G,
+                time_label=time_label,
+                out_path=frame_paths[idx],
+                # plot args
+                degree_weight=degree_weight,
+                base_size=base_size,
+                size_per_degree=size_per_degree,
+                edge_width=edge_width,
+                edge_alpha=edge_alpha,
+                node_edgecolor=node_edgecolor,
+                node_facecolor=node_facecolor,
+                contour_width=contour_width,
+                add_features=add_features,
+                extent=(fixed_extent if fixed_extent is not None else 'auto'),
+                extent_margin=extent_margin,
+                cities=cities,
+                dpi=dpi,
+                figsize=figsize,
+                time_loc=time_loc,
+                time_fontsize=time_fontsize,
+                time_box=time_box,
+                dim=self.dim,
+                directed=self.directed
+            ))
+
+        # Ejecuta serial o en paralelo
+        try:
+            if n_jobs == 1:
+                for t in tqdm(tasks, desc="Rendering GIF frames"):
+                    _render_map_frame(t)
+            else:
+                # Multiprocessing
+                with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+                    futures = [ex.submit(_render_map_frame, t) for t in tasks]
+                    for _ in tqdm(as_completed(futures), total=len(futures), desc="Rendering GIF frames"):
+                        pass  # solo para la barra; se generan los frames en paralelo
+
+            with imageio.get_writer(out_path, mode='I', duration=duration, loop=loop) as writer:
+                from PIL import Image
+                for p in frame_paths:
+                    img = imageio.imread(p)
+                    # quitar alfa si existe
+                    if img.ndim == 3 and img.shape[2] == 4:
+                        img = img[:, :, :3]
+                    # opción: reescalar para GIF
+                    if max_side is not None:
+                        h, w = img.shape[0], img.shape[1]
+                        if max(h, w) > max_side:
+                            scale = max_side / max(h, w)
+                            new_size = (int(w*scale), int(h*scale))
+                            img = np.array(Image.fromarray(img).resize(new_size, Image.LANCZOS))
+                    writer.append_data(img)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        return out_path
+
+
+    def make_map_gif_faster(self, out_path, *,
+                        duration=1,               # segundos por frame
+                        cities=None,
+                        extent="auto_union",
+                        extent_margin=(1.0, 0.25),
+                        annotate_time=True,
+                        time_fmt="%Y-%m-%d",
+                        time_loc="ul",
+                        time_fontsize=12,
+                        time_box=True,
+                        dpi=200, figsize=(6, 6),
+                        # Parámetros de plot_on_map:
+                        degree_weight=True,
+                        base_size=2.0,
+                        size_per_degree=1.0,
+                        edge_width=0.3,
+                        edge_alpha=0.25,
+                        node_edgecolor='black',
+                        node_facecolor='red',
+                        contour_width=0.4,
+                        add_features=True,
+                        show=False,
+                        loop=0,
+                        n_jobs=1,
+                        max_side=None):
+
+        if not self.save_graph:
+            raise ValueError("No graphs saved. Initialize with save_graphs=True and execute do_evolution().")
+        if len(self.graphs) == 0:
+            raise ValueError("self.graphs is empty. Did you execute do_evolution()?")
+
+        # ---- extent fijo (opcional) ----
+        fixed_extent = None
+        if extent == "auto_union":
+            all_lons, all_lats = [], []
+            for G in self.graphs:
+                pos = nx.get_node_attributes(G, 'pos')
+                if not pos:
+                    continue
+                lons = [p[0] for p in pos.values()]
+                lats = [p[1] for p in pos.values()]
+                all_lons.extend(lons); all_lats.extend(lats)
+            if not all_lons:
+                raise ValueError("No node 'pos' found to determine global extent.")
+            dx, dy = extent_margin
+            fixed_extent = (min(all_lons)-dx, max(all_lons)+dx, min(all_lats)-dy, max(all_lats)+dy)
+        elif isinstance(extent, tuple) or extent in ("auto", None):
+            fixed_extent = extent
+        else:
+            raise ValueError("Invalid 'extent'. Use 'auto_union', 'auto', tuple or None.")
+
+        # ---- carpeta temporal ----
+        tmpdir = tempfile.mkdtemp(prefix="mapgif_")
+        frame_paths = [os.path.join(tmpdir, f"frame_{i:04d}.png") for i in range(len(self.graphs))]
+
+        # ---- preparar tareas ----
+        tasks = []
+        for idx, G in enumerate(self.graphs):
+            time_label = None
+            if annotate_time and idx < len(self.time):
+                ts = self.time[idx]
+                try:
+                    time_label = ts.strftime(time_fmt)
+                except Exception:
+                    time_label = str(ts)
+
+            tasks.append(dict(
+                idx=idx,
+                graph=G,
+                time_label=time_label,
+                out_path=frame_paths[idx],
+                degree_weight=degree_weight,
+                base_size=base_size,
+                size_per_degree=size_per_degree,
+                edge_width=edge_width,
+                edge_alpha=edge_alpha,
+                node_edgecolor=node_edgecolor,
+                node_facecolor=node_facecolor,
+                contour_width=contour_width,
+                add_features=add_features,
+                extent=(fixed_extent if fixed_extent is not None else 'auto'),
+                extent_margin=extent_margin,
+                cities=cities,
+                dpi=dpi,
+                figsize=figsize,
+                time_loc=time_loc,
+                time_fontsize=time_fontsize,
+                time_box=time_box,
+                dim=self.dim,
+                directed=self.directed
+            ))
+
+        # ---- render serial o paralelo ----
+        try:
+            if n_jobs == 1:
+                for t in tqdm(tasks, desc="Rendering GIF frames"):
+                    _render_map_frame(t)
+            else:
+                with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+                    futures = [ex.submit(_render_map_frame, t) for t in tasks]
+                    for _ in tqdm(as_completed(futures), total=len(futures), desc="Rendering GIF frames"):
+                        pass
+
+            # ---- leer frames, quitar alfa y (opcional) reescalar ----
+            frames_np = []
+            for p in frame_paths:
+                img = iio.imread(p)
+                if img.ndim == 3 and img.shape[2] == 4:
+                    img = img[:, :, :3]  # RGB
+                if max_side is not None:
+                    h, w = img.shape[:2]
+                    if max(h, w) > max_side:
+                        scale = max_side / max(h, w)
+                        new_size = (int(w*scale), int(h*scale))
+                        img = np.array(Image.fromarray(img).resize(new_size, Image.LANCZOS))
+                frames_np.append(img)
+
+            # ---- escribir GIF con imageio v3 ----
+            # duration en milisegundos (int); puede ser lista por-frame si quieres
+            dur_ms = int(duration * 1000)
+            iio.imwrite(out_path, frames_np, duration=dur_ms, loop=loop)  # loop=0 = infinito
+
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+        return out_path
+
+
 
 
 
