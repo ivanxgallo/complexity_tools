@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
+import traceback
 from collections import Counter
 from tqdm.auto import tqdm
 import os, tempfile, shutil
@@ -25,7 +26,7 @@ def _render_map_frame(task):
     """
     task: dict con:
     - idx, graph, time_label (str o None), out_path (png)
-    - plot kwargs: degree_weight, base_size, size_per_degree, ...
+    - plot kwargs: degree_weight, base_size, size_per_unit, ...
     - extent, extent_margin, cities, dpi, figsize, time_loc, time_fontsize, time_box
     """
     # Reutilizar tu PPN
@@ -35,9 +36,9 @@ def _render_map_frame(task):
     # Dibujar
     ax = ppn.plot_on_map(
         ax=None,
-        degree_weight=task["degree_weight"],
+        #degree_weight=task["degree_weight"],
         base_size=task["base_size"],
-        size_per_degree=task["size_per_degree"],
+        size_per_unit=task["size_per_unit"],
         edge_width=task["edge_width"],
         edge_alpha=task["edge_alpha"],
         node_edgecolor=task["node_edgecolor"],
@@ -49,7 +50,10 @@ def _render_map_frame(task):
         cities=task["cities"],
         dpi=task["dpi"],
         figsize=task["figsize"],
-        show=False
+        show=task["show"],
+        node_attribute=task["node_attribute"],
+        percentile=task["percentile"],
+        show_edges=task["show_edges"]
     )
 
     # Timestamp en el frame (opcional)
@@ -92,12 +96,15 @@ class PointProcessNetwork:
         self.events = df[[time_col] + space_cols].sort_values(by=time_col).reset_index(drop=True)
 
 
-    def load_events_from_csv(self, filepath, time_col='t', space_cols=None, sep=" "):
+    def load_events_from_csv(self, filepath, time_col='t', space_cols=None, sep=" ", n_data=None):
         """
         Carga eventos desde un archivo CSV.
         """
         df = pd.read_csv(filepath, sep=sep)
-        self.load_events_from_df(df, time_col, space_cols)
+        if n_data is None:
+            self.load_events_from_df(df, time_col, space_cols)
+        else:
+            self.load_events_from_df(df.head(n_data), time_col, space_cols)
 
 
     def create_grid(self, cell_size):
@@ -299,41 +306,43 @@ class PointProcessNetwork:
 
 
     def plot_on_map(self, ax=None, *,
-                    degree_weight=True,
-                    base_size=2.0,
-                    size_per_degree=1.0,
-                    edge_width=0.3,
-                    edge_alpha=0.25,
-                    node_edgecolor='black',
-                    node_facecolor='red',
-                    contour_width=0.4,
-                    add_features=True,
-                    extent='auto',
-                    extent_margin=(1.0, 0.25),
-                    cities=None,
-                    city_size=70,
-                    city_color="gold",
-                    city_textsize=12,
-                    savepath=None,
-                    dpi=200, figsize=(6, 6),
-                    show=True):
+                node_attribute="degree",      # NUEVO: atributo a graficar
+                percentile=None,              # NUEVO: filtro por percentil
+                base_size=2.0,
+                size_per_unit=1.0,             # escalado genérico
+                edge_width=0.3,
+                edge_alpha=0.25,
+                node_edgecolor='black',
+                node_facecolor='red',
+                contour_width=0.4,
+                add_features=True,
+                extent='auto',
+                extent_margin=(1.0, 0.25),
+                cities=None,
+                city_size=70,
+                city_color="gold",
+                city_textsize=12,
+                show_edges=True,               # NUEVO: mostrar o no enlaces
+                savepath=None,
+                dpi=200, figsize=(6, 6),
+                show=True):
         """
-        Dibuja el grafo sobre un mapa (lon, lat) usando las posiciones 'pos' de los nodos
-        (asumidas como (lon, lat)). Requiere Cartopy.
-
-        - extent: 'auto' | tuple (min_lon, max_lon, min_lat, max_lat) | None
+        Dibuja el grafo sobre un mapa (lon, lat) usando un atributo como tamaño de nodo.
+        - node_attribute: "degree" o cualquier otro atributo de nodo ya calculado.
+        - percentile: filtra los nodos mostrando solo los que estén en el top X% del atributo.
+        - show_edges: si False, no dibuja aristas.
         """
         if not _HAS_CARTOPY:
             raise ImportError("Cartopy is not installed. Use `pip install cartopy`")
 
-        # Crear figura/ax con proyección si no viene uno
+        # Crear figura/ax si no viene uno
         created_fig = False
         if ax is None:
             fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()},
                                     dpi=dpi, figsize=figsize)
             created_fig = True
 
-        # Posiciones de nodos (lon, lat) guardadas en 'pos'
+        # Posiciones de nodos
         pos = nx.get_node_attributes(self.graph, 'pos')
         if not pos:
             raise ValueError("No hay posiciones 'pos' en los nodos. ¿Llamaste a build_sequential_graph()?")
@@ -342,12 +351,11 @@ class PointProcessNetwork:
         if extent == 'auto':
             lons = [p[0] for p in pos.values()]
             lats = [p[1] for p in pos.values()]
-            if len(lons) == 0:
+            if not lons:
                 raise ValueError("No hay nodos para determinar extent.")
             dx, dy = extent_margin
             extent = (min(lons) - dx, max(lons) + dx, min(lats) - dy, max(lats) + dy)
 
-        # Configurar límites
         if extent is not None:
             ax.set_extent(extent, crs=ccrs.PlateCarree())
 
@@ -361,24 +369,40 @@ class PointProcessNetwork:
             gl.top_labels = False
             gl.right_labels = False
 
-        # Nodos conectados (grado > 0)
-        connected = [(n, d) for n, d in self.graph.degree() if d > 0]
+        # Obtener valores del atributo
+        if node_attribute == "degree":
+            attr_values = dict(self.graph.degree())
+        else:
+            # Verifica si el atributo existe
+            sample_node = next(iter(self.graph.nodes))
+            if node_attribute not in self.graph.nodes[sample_node]:
+                raise ValueError(f"El atributo '{node_attribute}' no está calculado en los nodos.")
+            attr_values = nx.get_node_attributes(self.graph, node_attribute)
 
-        # Dibujar edges primero (debajo)
-        for u, v in self.graph.edges():
-            lon_u, lat_u = pos[u]
-            lon_v, lat_v = pos[v]
-            ax.plot([lon_u, lon_v], [lat_u, lat_v],
-                    transform=ccrs.PlateCarree(),
-                    linewidth=edge_width,
-                    color='black',
-                    alpha=edge_alpha,
-                    zorder=4)
+        # Filtro por percentil
+        if percentile is not None:
+            threshold = np.percentile(list(attr_values.values()), 100 - percentile)
+            nodes_to_plot = [n for n, v in attr_values.items() if v >= threshold]
+        else:
+            nodes_to_plot = list(self.graph.nodes)
+
+        # Mostrar aristas si corresponde
+        if show_edges:
+            for u, v in self.graph.edges():
+                if u in nodes_to_plot and v in nodes_to_plot:
+                    lon_u, lat_u = pos[u]
+                    lon_v, lat_v = pos[v]
+                    ax.plot([lon_u, lon_v], [lat_u, lat_v],
+                            transform=ccrs.PlateCarree(),
+                            linewidth=edge_width,
+                            color='black',
+                            alpha=edge_alpha,
+                            zorder=4)
 
         # Dibujar nodos
-        for n, deg in connected:
+        for n in nodes_to_plot:
             lon, lat = pos[n]
-            size = base_size + (deg * size_per_degree if degree_weight else 0.0)
+            size = base_size + (attr_values[n] * size_per_unit)
             ax.scatter(lon, lat,
                         transform=ccrs.PlateCarree(),
                         s=size,
@@ -757,132 +781,6 @@ class EvolvingNetwork:
         return out_path
 
 
-    def make_map_gif_fast(self, out_path, *,
-                    duration=4,
-                    cities=None,
-                    extent="auto_union",
-                    extent_margin=(1.0, 0.25),
-                    annotate_time=True,
-                    time_fmt="%Y-%m-%d",
-                    time_loc="ul",
-                    time_fontsize=12,
-                    time_box=True,
-                    dpi=200, figsize=(6, 6),
-                    # Parámetros de plot_on_map:
-                    degree_weight=True,
-                    base_size=2.0,
-                    size_per_degree=1.0,
-                    edge_width=0.3,
-                    edge_alpha=0.25,
-                    node_edgecolor='black',
-                    node_facecolor='red',
-                    contour_width=0.4,
-                    add_features=True,
-                    show=False,
-                    loop=0,
-                    n_jobs=1,              # <--- NUEVO: # procesos (1 = serial)
-                    max_side=None):        # opcional: reescalar frames para GIF
-        import tempfile, shutil
-        if not self.save_graph:
-            raise ValueError("No graphs saved. Initialize with save_graphs=True and execute do_evolution().")
-        if len(self.graphs) == 0:
-            raise ValueError("self.graphs is empty. Did you execute do_evolution()?")
-
-        # ----- extent fijo (opcional) -----
-        fixed_extent = None
-        if extent == "auto_union":
-            all_lons, all_lats = [], []
-            for G in self.graphs:
-                pos = nx.get_node_attributes(G, 'pos')
-                if not pos:
-                    continue
-                lons = [p[0] for p in pos.values()]
-                lats = [p[1] for p in pos.values()]
-                all_lons.extend(lons); all_lats.extend(lats)
-            if not all_lons:
-                raise ValueError("No node 'pos' found to determine global extent.")
-            dx, dy = extent_margin
-            fixed_extent = (min(all_lons)-dx, max(all_lons)+dx, min(all_lats)-dy, max(all_lats)+dy)
-        elif isinstance(extent, tuple) or extent in ("auto", None):
-            fixed_extent = extent
-        else:
-            raise ValueError("Invalid 'extent'. Use 'auto_union', 'auto', tuple or None.")
-
-        # ----- carpeta temporal -----
-        tmpdir = tempfile.mkdtemp(prefix="mapgif_")
-        frame_paths = [os.path.join(tmpdir, f"frame_{i:04d}.png") for i in range(len(self.graphs))]
-
-        # Prepara tareas
-        tasks = []
-        for idx, G in enumerate(self.graphs):
-            time_label = None
-            if annotate_time and idx < len(self.time):
-                ts = self.time[idx]
-                try:
-                    time_label = ts.strftime(time_fmt)
-                except Exception:
-                    time_label = str(ts)
-
-            tasks.append(dict(
-                idx=idx,
-                graph=G,
-                time_label=time_label,
-                out_path=frame_paths[idx],
-                # plot args
-                degree_weight=degree_weight,
-                base_size=base_size,
-                size_per_degree=size_per_degree,
-                edge_width=edge_width,
-                edge_alpha=edge_alpha,
-                node_edgecolor=node_edgecolor,
-                node_facecolor=node_facecolor,
-                contour_width=contour_width,
-                add_features=add_features,
-                extent=(fixed_extent if fixed_extent is not None else 'auto'),
-                extent_margin=extent_margin,
-                cities=cities,
-                dpi=dpi,
-                figsize=figsize,
-                time_loc=time_loc,
-                time_fontsize=time_fontsize,
-                time_box=time_box,
-                dim=self.dim,
-                directed=self.directed
-            ))
-
-        # Ejecuta serial o en paralelo
-        try:
-            if n_jobs == 1:
-                for t in tqdm(tasks, desc="Rendering GIF frames"):
-                    _render_map_frame(t)
-            else:
-                # Multiprocessing
-                with ProcessPoolExecutor(max_workers=n_jobs) as ex:
-                    futures = [ex.submit(_render_map_frame, t) for t in tasks]
-                    for _ in tqdm(as_completed(futures), total=len(futures), desc="Rendering GIF frames"):
-                        pass  # solo para la barra; se generan los frames en paralelo
-
-            with imageio.get_writer(out_path, mode='I', duration=duration, loop=loop) as writer:
-                from PIL import Image
-                for p in frame_paths:
-                    img = imageio.imread(p)
-                    # quitar alfa si existe
-                    if img.ndim == 3 and img.shape[2] == 4:
-                        img = img[:, :, :3]
-                    # opción: reescalar para GIF
-                    if max_side is not None:
-                        h, w = img.shape[0], img.shape[1]
-                        if max(h, w) > max_side:
-                            scale = max_side / max(h, w)
-                            new_size = (int(w*scale), int(h*scale))
-                            img = np.array(Image.fromarray(img).resize(new_size, Image.LANCZOS))
-                    writer.append_data(img)
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-        return out_path
-
-
     def make_map_gif_faster(self, out_path, *,
                         duration=1,               # segundos por frame
                         cities=None,
@@ -895,9 +793,12 @@ class EvolvingNetwork:
                         time_box=True,
                         dpi=200, figsize=(6, 6),
                         # Parámetros de plot_on_map:
-                        degree_weight=True,
+                        show_edges=True,
+                        node_attribute="degree",
+                        percentile=None,
+                        #degree_weight=True,
                         base_size=2.0,
-                        size_per_degree=1.0,
+                        size_per_unit=1.0,
                         edge_width=0.3,
                         edge_alpha=0.25,
                         node_edgecolor='black',
@@ -916,23 +817,31 @@ class EvolvingNetwork:
 
         # ---- extent fijo (opcional) ----
         fixed_extent = None
-        if extent == "auto_union":
-            all_lons, all_lats = [], []
-            for G in self.graphs:
-                pos = nx.get_node_attributes(G, 'pos')
-                if not pos:
-                    continue
-                lons = [p[0] for p in pos.values()]
-                lats = [p[1] for p in pos.values()]
-                all_lons.extend(lons); all_lats.extend(lats)
-            if not all_lons:
-                raise ValueError("No node 'pos' found to determine global extent.")
+        if extent in ("df", "auto_union"):
+            # usar bounds desde el dataframe de origen (más rápido/estable)
+            if self.dim < 2 or len(self.space_cols) < 2:
+                raise ValueError("It is required at least 2 spatial columns (lon/lat) to set extent from DF.")
+            lon_col, lat_col = self.space_cols[0], self.space_cols[1]
+
+            # filtrar NaN/inf
+            lons = self.df[lon_col].to_numpy()
+            lats = self.df[lat_col].to_numpy()
+            mask = np.isfinite(lons) & np.isfinite(lats)
+            if not mask.any():
+                raise ValueError("No valid spatial values (lon/lat) in the DataFrame to determine extent.")
+
+            lons = lons[mask]; lats = lats[mask]
             dx, dy = extent_margin
-            fixed_extent = (min(all_lons)-dx, max(all_lons)+dx, min(all_lats)-dy, max(all_lats)+dy)
-        elif isinstance(extent, tuple) or extent in ("auto", None):
+            fixed_extent = (float(np.min(lons) - dx),
+                            float(np.max(lons) + dx),
+                            float(np.min(lats) - dy),
+                            float(np.max(lats) + dy))
+        elif isinstance(extent, tuple):
             fixed_extent = extent
+        elif extent in ("auto", None):
+            fixed_extent = extent  # delega el auto por frame (puede 'respirar')
         else:
-            raise ValueError("Invalid 'extent'. Use 'auto_union', 'auto', tuple or None.")
+            raise ValueError("Invalid 'extent'. Use 'df', 'auto_union', 'auto', tuple or None.")
 
         # ---- carpeta temporal ----
         tmpdir = tempfile.mkdtemp(prefix="mapgif_")
@@ -954,9 +863,9 @@ class EvolvingNetwork:
                 graph=G,
                 time_label=time_label,
                 out_path=frame_paths[idx],
-                degree_weight=degree_weight,
+                #degree_weight=degree_weight,
                 base_size=base_size,
-                size_per_degree=size_per_degree,
+                size_per_unit=size_per_unit,
                 edge_width=edge_width,
                 edge_alpha=edge_alpha,
                 node_edgecolor=node_edgecolor,
@@ -972,23 +881,38 @@ class EvolvingNetwork:
                 time_fontsize=time_fontsize,
                 time_box=time_box,
                 dim=self.dim,
-                directed=self.directed
+                directed=self.directed,
+                node_attribute=node_attribute,
+                percentile=percentile,
+                show_edges=show_edges,
+                show=show
             ))
 
         # ---- render serial o paralelo ----
         try:
             if n_jobs == 1:
                 for t in tqdm(tasks, desc="Rendering GIF frames"):
-                    _render_map_frame(t)
+                    try:
+                        _render_map_frame(t)
+                    except Exception as e:
+                        print(f"[ERROR] Frame idx={t['idx']} falló: {type(e).__name__}: {e}")
+                        traceback.print_exc()
+                        # Si quieres continuar y dejar ese frame en blanco, comenta el raise:
+                        raise
             else:
                 with ProcessPoolExecutor(max_workers=n_jobs) as ex:
                     futures = [ex.submit(_render_map_frame, t) for t in tasks]
-                    for _ in tqdm(as_completed(futures), total=len(futures), desc="Rendering GIF frames"):
-                        pass
+                    for fut in tqdm(as_completed(futures), total=len(futures), desc="Rendering GIF frames"):
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            print(f"[ERROR] Frame en proceso paralelo falló: {type(e).__name__}: {e}")
+                            traceback.print_exc()
+                            raise
 
             # ---- leer frames, quitar alfa y (opcional) reescalar ----
             frames_np = []
-            for p in frame_paths:
+            for j, p in enumerate(frame_paths):
                 img = iio.imread(p)
                 if img.ndim == 3 and img.shape[2] == 4:
                     img = img[:, :, :3]  # RGB
