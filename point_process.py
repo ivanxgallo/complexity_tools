@@ -16,12 +16,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 try:
     import cartopy.crs as ccrs
     import cartopy.feature as cfeature
+    from cartopy.feature import NaturalEarthFeature
     _HAS_CARTOPY = True
 except Exception:
     _HAS_CARTOPY = False
 
 
-# Worker para un frame (nivel de módulo)
+# ---------------- AUXILIAR FUNCTIONS ---------------- #
 def _render_map_frame(task):
     """
     task: dict con:
@@ -53,7 +54,8 @@ def _render_map_frame(task):
         show=task["show"],
         node_attribute=task["node_attribute"],
         percentile=task["percentile"],
-        show_edges=task["show_edges"]
+        show_edges=task["show_edges"],
+        road_color= task["road_color"],
     )
 
     # Timestamp en el frame (opcional)
@@ -77,13 +79,25 @@ def _render_map_frame(task):
     return task["out_path"]
 
 
-
+# ---------------- POINT PROCESS NETWORK ---------------- #
 class PointProcessNetwork:
-    def __init__(self, dim=2, directed=False):
+    def __init__(self, dim=2, directed=False, df=None, time_col=None, space_cols=None):
+        if space_cols:
+            if isinstance(space_cols, str):
+                space_cols = [space_cols]
+            assert len(space_cols) == dim, f"Expected {dim} spatial columns, but got {len(space_cols)}."
         self.dim = dim
         self.events = None
         self.grid = None
         self.graph = nx.DiGraph() if directed else nx.Graph()
+        if df is not None and space_cols is not None:
+            # Si no se especifica columna de tiempo, se crea un contador
+            if time_col is None:
+                df = df.copy()
+                df.insert(0, 't_counter', range(1, len(df) + 1))
+                time_col = 't_counter'
+                print(f"[INFO] Time column is not specified. Using '{time_col}' as time index.")
+            self.load_events_from_df(df, time_col, space_cols)
 
 
     def load_events_from_df(self, df, time_col='t', space_cols=None):
@@ -92,19 +106,26 @@ class PointProcessNetwork:
         """
         if space_cols is None:
             space_cols = [col for col in df.columns if col != time_col]
-        assert len(space_cols) == self.dim, "Dimensión del espacio no coincide"
+        assert len(space_cols) == self.dim, f"Expected {self.dim} spatial columns, but got {len(space_cols)}."
         self.events = df[[time_col] + space_cols].sort_values(by=time_col).reset_index(drop=True)
+        self.time_col = time_col
+        self.space_cols = space_cols
 
 
     def load_events_from_csv(self, filepath, time_col='t', space_cols=None, sep=" ", n_data=None):
         """
         Carga eventos desde un archivo CSV.
         """
-        df = pd.read_csv(filepath, sep=sep)
-        if n_data is None:
-            self.load_events_from_df(df, time_col, space_cols)
+        if time_col and space_cols:
+            df = pd.read_csv(filepath, sep=sep)
+            if n_data is None:
+                self.load_events_from_df(df, time_col, space_cols)
+            else:
+                self.load_events_from_df(df.head(n_data), time_col, space_cols)
+            self.time_col = time_col
+            self.space_cols = space_cols
         else:
-            self.load_events_from_df(df.head(n_data), time_col, space_cols)
+            raise ValueError("Must be specified 'time_col' and 'space_cols' to load events from CSV file.")
 
 
     def create_grid(self, cell_size):
@@ -313,7 +334,8 @@ class PointProcessNetwork:
                 edge_width=0.3,
                 edge_alpha=0.25,
                 node_edgecolor='black',
-                node_facecolor='red',
+                node_facecolor='blue',
+                road_color='red',
                 contour_width=0.4,
                 add_features=True,
                 extent='auto',
@@ -361,6 +383,14 @@ class PointProcessNetwork:
 
         # Features base
         if add_features:
+            roads = NaturalEarthFeature(
+            category="cultural",  # Tipo de datos: culturales
+            name="roads",         # Carreteras
+            scale="10m",          # Resolución: 10m es la más detallada
+            facecolor="none"      # Sin color de relleno
+            )
+
+            ax.add_feature(roads, edgecolor=road_color, linewidth=1, alpha=0.7)
             ax.add_feature(cfeature.COASTLINE, linewidth=1)
             ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5)
             ax.add_feature(cfeature.LAND, facecolor='lightgray')
@@ -437,28 +467,225 @@ class PointProcessNetwork:
         return ax
 
 
+    def compute_advanced(self, what="bc", *, attribute_name=None,
+                        backend="networkit", normalized=True,
+                        approx=False, approx_eps=0.01, approx_delta=0.1,
+                        n_threads=None, get_stats=False):
+        """
+        Calcula atributos 'avanzados' (rápidos con NetworKit) y los escribe en self.graph.
+        Por ahora soporta:
+        - what="bc"  -> betweenness centrality
 
+        Parámetros
+        ----------
+        what : str
+            Nombre del cómputo. Por ahora: "bc".
+        attribute_name : str | None
+            Nombre del atributo a escribir en los nodos. Por defecto:
+            - "bc" para betweenness
+        backend : {"networkit","networkx"}
+            Preferencia de backend. Si networkit no está disponible o falla,
+            cae a networkx automáticamente.
+        normalized : bool
+            Si normalizar el resultado (aplica a bc).
+        approx : bool
+            Si True (y backend = networkit), usa estimación (más rápida).
+        approx_eps : float
+            Epsilon para estimación (NetworKit).
+        approx_delta : float
+            Delta para estimación (NetworKit).
+        n_threads : int | None
+            Número de hilos para NetworKit. Si None, usa el default.
+
+        Retorna
+        -------
+        dict
+            {nodo: valor} con el atributo calculado.
+        """
+        G = self.graph
+        if G.number_of_nodes() == 0:
+            return {}
+
+        # Nombre de atributo por defecto
+        if attribute_name is None:
+            attribute_name = {"bc": "bc"}.get(what, what)
+
+        # --- Betweenness centrality ---
+        if what == "bc":
+            try:
+                # Caso trivial: sin aristas
+                if G.number_of_edges() == 0:
+                    zeros = {n: 0.0 for n in G.nodes()}
+                    nx.set_node_attributes(G, zeros, attribute_name)
+                    return zeros
+
+                # Intentar NetworKit si está disponible y pedido
+                if backend == "networkit":
+                    try:
+                        import networkit as nk
+                        if n_threads is not None and n_threads > 0:
+                            nk.setNumberOfThreads(int(n_threads))
+
+                        # NetworkX -> NetworKit (índices 0..N-1)
+                        nodes = list(G.nodes())
+                        idx_of = {n: i for i, n in enumerate(nodes)}
+                        nkG = nk.Graph(n=G.number_of_nodes(), weighted=False, directed=G.is_directed())
+
+                        for u, v in G.edges():
+                            nkG.addEdge(idx_of[u], idx_of[v])
+
+                        # Betweenness exacta o estimada
+                        if approx:
+                            algo = nk.centrality.EstimateBetweenness(
+                                nkG, epsilon=approx_eps, delta=approx_delta, normalized=normalized
+                            )
+                        else:
+                            algo = nk.centrality.Betweenness(nkG, normalized=normalized)
+
+                        algo.run()
+                        scores = algo.scores()  # lista alineada con índices
+                        result = {nodes[i]: float(scores[i]) for i in range(len(nodes))}
+
+                        nx.set_node_attributes(G, result, attribute_name)
+                        if get_stats:
+                            return result
+
+                    except Exception as e:
+                        # Fallback a NetworkX si NetworKit no está o falló
+                        # (podrías loguear e si quieres más detalle)
+                        print(f"[WARN] NetworKit failed: {e}")
+                        backend = "networkx"
+
+                # Fallback / opción explícita: NetworkX
+                if backend == "networkx":
+                    result = nx.betweenness_centrality(G, normalized=normalized)
+                    nx.set_node_attributes(G, result, attribute_name)
+                    if get_stats:
+                        return result
+            except Exception as e:
+                # Si llega aquí, algo raro pasó en el enrutamiento de backend
+                raise print("Could not compute 'bc' with the backends available. ERROR:", e)
+
+        else:
+            # Punto de extensión: agrega más elif aquí para otras métricas
+            raise ValueError(f"'{what}' is not implemented yet. Use 'bc' for now.")
+
+
+    def node_attribute_timeseries(self, attribute="degree", *,
+                                degree_kind="total",    # 'total' | 'in' | 'out' (solo si attribute='degree')
+                                default=np.nan,
+                                show_progress=False):
+        """
+        Construye una serie de tiempo tomando, para cada evento, el valor de un atributo del
+        nodo (celda) en el que cae ese evento.
+
+        Parámetros
+        ----------
+        attribute : str
+            Nombre del atributo de nodo a leer. Caso especial: 'degree'.
+        degree_kind : {'total','in','out'}
+            Si attribute='degree', qué grado reportar (para grafos dirigidos).
+        default : float
+            Valor a usar si el nodo no existe en self.graph o no tiene el atributo.
+        show_progress : bool
+            Si True, muestra barra de progreso (tqdm).
+
+        Retorna
+        -------
+        pd.Series
+            Serie indexada por tiempo del evento, con el valor del atributo.
+        """
+        # Requisitos
+        assert self.events is not None, "Primero carga eventos con load_events_from_df()."
+        assert self.grid is not None, "Primero crea la grilla con create_grid()."
+        assert self.graph is not None, "Primero construye el grafo con build_sequential_graph()."
+
+        # Tiempos y coords
+        times = self.events.iloc[:, 0].values
+        coords = self.events.iloc[:, 1:].values
+
+        # Diccionarios de lookup de atributo
+        if attribute == "degree":
+            if degree_kind == "total":
+                attr_dict = dict(self.graph.degree())
+            elif degree_kind == "in":
+                if not self.graph.is_directed():
+                    raise ValueError("degree_kind='in' requiere grafo dirigido.")
+                attr_dict = dict(self.graph.in_degree())
+            elif degree_kind == "out":
+                if not self.graph.is_directed():
+                    raise ValueError("degree_kind='out' requiere grafo dirigido.")
+                attr_dict = dict(self.graph.out_degree())
+            else:
+                raise ValueError("degree_kind debe ser 'total', 'in' o 'out'.")
+            degree_default = 0  # si el nodo no está, consideramos grado 0
+        else:
+            attr_dict = nx.get_node_attributes(self.graph, attribute)
+            degree_default = None  # no aplica
+
+        # Iterar eventos
+        iterator = coords
+        if show_progress:
+            iterator = tqdm(coords, desc="Building attribute time series", leave=False)
+
+        values = []
+        for x in iterator:
+            cell = self.locate_event_cell(x)  # tuple índice de celda
+            if attribute == "degree":
+                val = attr_dict.get(cell, degree_default)
+            else:
+                val = attr_dict.get(cell, default)
+            # si sigue faltando (p.ej. degree_default=None en atributos no-degree)
+            if val is None:
+                val = default
+            values.append(val)
+
+        # Serie con índice temporal
+        return pd.Series(values, index=pd.to_datetime(times), name=attribute)
+
+
+# ---------------- Evolving Network ---------------- #
 class EvolvingNetwork:
     def __init__(self, point_process_df, time_col='t', space_cols=None,
                     dim=2, directed=False, timestamp_method='mean', save_graphs=False):
         # --- Normalización de space_cols ---
         if space_cols is None:
-            space_cols = [col for col in point_process_df.columns if col != time_col]
+            # si no te pasan space_cols, tomamos todas menos la de tiempo (si existe)
+            if time_col is not None and time_col in point_process_df.columns:
+                space_cols = [c for c in point_process_df.columns if c != time_col]
+            else:
+                # si tampoco hay time_col, toma todas (ya filtraremos al armar cols)
+                space_cols = list(point_process_df.columns)
         elif isinstance(space_cols, str):
-            space_cols = [space_cols]  # caso dim = 1
+            space_cols = [space_cols]
 
-        # --- Validación ---
         assert isinstance(space_cols, (list, tuple)), "'space_cols' must be string, list or tuple"
-        assert all(isinstance(col, str) for col in space_cols), "All elements of 'space_cols' must bestrings"
+        assert all(isinstance(col, str) for col in space_cols), "All elements of 'space_cols' must be strings"
         assert len(space_cols) == dim, f"It is expected {dim} spatial columns, but {len(space_cols)} are given."
 
-        # --- Selección de columnas ---
+        df = point_process_df.copy()
+
+        # --- Manejo de time_col=None -> contador 1..N ---
+        if time_col is None:
+            self._time_is_counter = True
+            time_col = 't_counter'
+            # contador desde 1 a N (puedes usar 0..N-1 si prefieres)
+            df.insert(0, time_col, np.arange(1, len(df) + 1, dtype=int))
+        else:
+            self._time_is_counter = False
+            # coaccionar a datetime para el modo "time window"
+            df[time_col] = pd.to_datetime(df[time_col], errors='coerce')
+
+        # --- Selección de columnas (tiempo + espaciales) ---
         cols = [time_col] + list(space_cols)
-        point_process_df = point_process_df[cols].copy()
-        point_process_df[time_col] = pd.to_datetime(point_process_df[time_col])
-        self.df = point_process_df.sort_values(by=time_col).reset_index(drop=True)
+        df = df[cols].copy()
+
+        # Orden temporal (funciona con datetime o con contador numérico)
+        self.df = df.sort_values(by=time_col).reset_index(drop=True)
+
+        # guardar metadatos
         self.time_col = time_col
-        self.space_cols = space_cols
+        self.space_cols = list(space_cols)
         self.dim = dim
         self.directed = directed
         self.timestamp_method = timestamp_method
@@ -493,7 +720,7 @@ class EvolvingNetwork:
             raise ValueError(f"timestamp_method '{method}' no reconocido. Usa: 'mean', 'median', 'min' o 'max'.")
 
 
-    def build_by_time_window(self, window_size, step_size, cell_size=0.01):
+    def build_by_time_window(self, window_size, step_size, cell_size=0.01, advanced=None):
         """
         Divide el dataset en ventanas de tiempo deslizantes, construyendo grafos secuenciales.
 
@@ -531,16 +758,24 @@ class EvolvingNetwork:
 
                 self.time.append(timestamp)
                 self.stats.append(ppn.get_graph_stats())
+
+                if advanced:
+                    if not isinstance(advanced, list):
+                        advanced = [advanced]
+                    for ad in advanced:
+                        ppn.compute_advanced(what=ad)
+
                 if self.save_graph:
                     self.graphs.append(ppn.graph)
 
             except Exception as e:
-                print(f"[WARN] Se omite ventana en {timestamp} (error: {type(e).__name__} - {e})")
+                print(f"[WARN] Window {timestamp} is omitted (error: {type(e).__name__} - {e})")
                 continue
 
 
-    def build_by_event_window(self, window_size=1000, step_size=200, cell_size=0.01):
-        for start in tqdm(range(0, len(self.df) - window_size + 1, step_size), desc="Evolving Network by Event Window"):
+    def build_by_event_window(self, window_size=1000, step_size=200, cell_size=0.01, advanced=None):
+        for start in tqdm(range(0, len(self.df) - window_size + 1, step_size),
+                            desc="Evolving Network by Event Window"):
             end = start + window_size
             window_df = self.df.iloc[start:end]
             timestamp = self._compute_timestamp(window_df[self.time_col])
@@ -553,19 +788,20 @@ class EvolvingNetwork:
             self.time.append(timestamp)
             self.stats.append(ppn.get_graph_stats())
 
+            if advanced:
+                if not isinstance(advanced, list):
+                    advanced = [advanced]
+                for ad in advanced:
+                    ppn.compute_advanced(what=ad)
+
             if self.save_graph:
-                    self.graphs.append(ppn.graph)
+                self.graphs.append(ppn.graph)
 
 
     def do_evolution(self, method="event", **kwargs):
         """
         Ejecuta la evolución de la red según el método indicado.
-
-        Parámetros:
-        - method: "event" o "time"
-        - kwargs: parámetros para pasar al método correspondiente
         """
-
         self.time = []
         self.stats = []
         self.graphs = []
@@ -573,6 +809,11 @@ class EvolvingNetwork:
         if method == "event":
             self.build_by_event_window(**kwargs)
         elif method == "time":
+            if getattr(self, "_time_is_counter", False):
+                raise ValueError(
+                    "The method 'time' needs real timestamps. "
+                    "time_col is None. Use method='event'."
+                )
             self.build_by_time_window(**kwargs)
         else:
             raise ValueError("Method must be 'event' or 'time'")
@@ -802,7 +1043,8 @@ class EvolvingNetwork:
                         edge_width=0.3,
                         edge_alpha=0.25,
                         node_edgecolor='black',
-                        node_facecolor='red',
+                        node_facecolor='blue',
+                        road_color='red',
                         contour_width=0.4,
                         add_features=True,
                         show=False,
@@ -870,6 +1112,7 @@ class EvolvingNetwork:
                 edge_alpha=edge_alpha,
                 node_edgecolor=node_edgecolor,
                 node_facecolor=node_facecolor,
+                road_color=road_color,
                 contour_width=contour_width,
                 add_features=add_features,
                 extent=(fixed_extent if fixed_extent is not None else 'auto'),
