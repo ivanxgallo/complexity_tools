@@ -832,7 +832,7 @@ class EvolvingNetwork:
         plt.show()
 
 
-    def plot_all_stats(self, last=None, figsize=(10, 15), dpi=200, x_rotation=45, font_size=18):
+    def plot_all_stats(self, last=None, figsize=(10, 15), dpi=200, rotation=45, font_size=18, savepath=None):
         """
         Plotea todas las métricas principales de la evolución de la red en subplots separados.
 
@@ -881,9 +881,11 @@ class EvolvingNetwork:
 
         # Formato eje X
         axes[-1].set_xlabel("Time", fontsize=font_size)
-        plt.xticks(rotation=x_rotation, fontsize=font_size - 2)
+        plt.xticks(rotation=rotation, fontsize=font_size - 2)
 
         plt.tight_layout(rect=[0, 0, 1, 0.98])
+        if savepath:
+            plt.savefig(savepath, bbox_inches='tight', dpi=dpi)
         plt.show()
 
 
@@ -1176,6 +1178,85 @@ class EvolvingNetwork:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         return out_path
+
+
+    def event_counts(self, freq='W', *, plot=True,
+                    color='red', linewidth=2, xlabel='Date',
+                    figsize=(12, 5), dpi=200, savepath=None,
+                    show=True, **kwargs):
+        """
+        Cuenta eventos por ventana temporal usando resample (D, W, M, ...).
+
+        Parámetros
+        ----------
+        freq : str
+            Frecuencia de remuestreo (p.ej. 'D' diario, 'W' semanal, 'M' mensual).
+        plot : bool
+            Si True, dibuja la serie.
+        color, linewidth : estilo del trazo.
+        xlabel, ylabel, title : etiquetas del gráfico.
+        figsize, dpi : tamaño y resolución de la figura.
+        savepath : str | None
+            Si se entrega, guarda la figura en esa ruta.
+        show : bool
+            Si True, muestra la figura.
+
+        Retorna
+        -------
+        pd.Series
+            Serie de conteo de eventos indexada por fecha (periodos).
+        """
+        # Si el "tiempo" es un contador (time_col=None en el constructor)
+        if getattr(self, "_time_is_counter", False):
+            raise ValueError(
+                "No hay timestamps reales (inicializaste con time_col=None). "
+                "event_counts() requiere fechas para re-muestrear por calendario."
+            )
+
+        interval_dict = {
+            "W": "Week",
+            "M": "Month",
+            "D": "Day",
+            "H": "Hour",
+            "T": "Minute",
+            "S": "Second"
+        }
+
+        tcol = self.time_col
+        df = self.df.copy()
+
+        # Asegurar tipo datetime (por si entró como string)
+        df[tcol] = pd.to_datetime(df[tcol], errors='coerce')
+        if df[tcol].isna().all():
+            raise ValueError(f"Column '{tcol}' has no valid datetime values.")
+
+        # Resample (conteo por ventana temporal)
+        counts = df.resample(freq, on=tcol).size()
+        try:
+            counts.name = f'Events_per_{interval_dict[freq]}'
+        except KeyError:
+            raise ValueError(f"Frequency '{freq}' not recognized. Use one of: {list(interval_dict.keys())}")
+
+        if plot:
+            plt.figure(figsize=figsize, dpi=dpi)
+            counts.plot(color=color, linewidth=linewidth)
+            fs_label = kwargs.pop('fs_labels', 15)
+            plt.xlabel(xlabel, fontsize=fs_label)
+            plt.ylabel(f"Number of Events per {interval_dict[freq]}", fontsize=fs_label)
+            plt.grid(True, alpha=0.4)
+            fs_tick = kwargs.pop('fs_ticks', 14)
+            plt.xticks(rotation=kwargs.pop('rotation', 45), fontsize=fs_tick)
+            plt.yticks(fontsize=fs_tick)
+            plt.tight_layout()
+            if savepath:
+                plt.savefig(savepath, bbox_inches='tight', dpi=dpi)
+            if show:
+                plt.show()
+            else:
+                plt.close()
+        else:
+            return counts
+
 
 
 

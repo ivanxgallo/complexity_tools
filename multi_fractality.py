@@ -53,6 +53,158 @@ def _compute_mfdfa_single_q(ts, profile, scales, q_val, order, double):
     return q_val, scales[:len(flucts)], np.array(flucts)
 
 
+def compare_multifractal_attribute(
+    mf_list,
+    what="hq",
+    labels=None,
+    cmap_name="tab20",
+    fs_labels=15,
+    fs_legend=10,
+    legend=True,
+    include_errors=True,
+    ax=None,
+    **kwargs
+):
+    """
+    Compara visualmente atributos de varios objetos MultiFractality.
+
+    Parámetros
+    ----------
+    mf_list : list[MultiFractality]
+        Lista de objetos ya calculados.
+    what : str
+        Qué comparar. Opciones:
+        - "hq"         : h(q) vs q usando resultados de fit_hq().
+        - "tau"        : tau(q) vs q (requiere haber calculado q_dense y tau).
+        - "spectrum"   : f(α) vs α (requiere alpha y f_alpha).
+    labels : list[str] or None
+        Etiquetas para la leyenda; por defecto usa "MF[i]".
+    cmap_name : str
+        Nombre del colormap para diferenciar curvas.
+    fs_labels, fs_legend : int
+        Tamaños de fuente para ejes y leyenda.
+    legend : bool
+        Si True, muestra leyenda.
+    xlog, ylog : bool
+        Escalas logarítmicas (en algunos 'what' ya se usan por naturaleza; aquí fuerzas si quieres).
+    include_errors : bool
+        Si True y what="hq", intenta dibujar barras de error si están disponibles.
+    q_value : float or None
+        Para what="fluctuations", indica el q a comparar.
+    ax : matplotlib.axes.Axes or None
+        Eje existente donde dibujar. Si None, crea figura/axes nuevos.
+    **kwargs :
+        Estilos extra: marker, linestyle, linewidth, alpha, etc.
+        Se pasan a plt.plot/plt.errorbar.
+
+    Returns
+    -------
+    fig, ax : matplotlib Figure y Axes
+    """
+    assert isinstance(mf_list, (list, tuple)) and len(mf_list) > 0, "mf_list debe ser una lista no vacía."
+
+    if labels is None:
+        labels = [f"MF[{i}]" for i in range(len(mf_list))]
+    else:
+        assert len(labels) == len(mf_list), "labels debe tener misma longitud que mf_list."
+
+    cmap = get_cmap(cmap_name)
+    created_fig = False
+    if ax is None:
+        fig, ax = plt.subplots(dpi=kwargs.pop('dpi', 200), figsize=kwargs.pop('figsize', (7, 5)))
+        created_fig = True
+    else:
+        fig = ax.figure
+
+    # Estilos por defecto (coherentes con tu clase)
+    default_marker = kwargs.pop('marker', 'o')
+    default_linestyle = kwargs.pop('linestyle', '-')
+    default_linewidth = kwargs.pop('linewidth', 1.4)
+    default_alpha = kwargs.pop('alpha', 0.9)
+    default_ms = kwargs.pop('markersize', 4)
+
+    # Dispatcher por tipo
+    what_norm = str(what).strip().lower()
+
+    if what_norm in ("hq", "h(q)", "hq_vs_q", "h_vs_q"):
+        # Cada objeto necesita mfdfa_results con 'h' y 'error_h' por q.
+        # Se plotea h(q) vs q. Si include_errors, usa barras de error.
+        ax.set_xlabel(r"$q$", fontsize=fs_labels)
+        ax.set_ylabel(r"$h(q)$", fontsize=fs_labels)
+
+        for i, (mf, label) in enumerate(zip(mf_list, labels)):
+            if not hasattr(mf, "mfdfa_results") or len(mf.mfdfa_results) == 0:
+                print(f"[WARN] {label}: no hay mfdfa_results. Omite.")
+                continue
+
+            # Tomar solo q que tengan 'h'
+            qs = [q for q in mf.mfdfa_results.keys() if "h" in mf.mfdfa_results[q]]
+            if len(qs) == 0:
+                print(f"[WARN] {label}: no hay ajustes h(q). Ejecuta fit_hq primero.")
+                continue
+
+            qs = sorted(qs)
+            hqs = np.array([mf.mfdfa_results[q]['h'] for q in qs])
+            errs = np.array([mf.mfdfa_results[q].get('error_h', np.nan) for q in qs])
+
+            color = cmap(i % cmap.N)
+            if include_errors and not np.all(np.isnan(errs)):
+                ax.errorbar(qs, hqs, yerr=errs, fmt=default_marker,
+                            markersize=default_ms, linestyle='',
+                            color=color, alpha=default_alpha, label=label, **kwargs)
+                # Unir con línea
+                ax.plot(qs, hqs, linestyle=default_linestyle, linewidth=default_linewidth,
+                        color=color, alpha=default_alpha*0.7)
+            else:
+                ax.plot(qs, hqs, marker=default_marker, markersize=default_ms,
+                        linestyle=default_linestyle, linewidth=default_linewidth,
+                        color=color, alpha=default_alpha, label=label)
+
+    elif what_norm in ("tau", "tau(q)", "tau_vs_q"):
+        # Requiere mf.q_dense y mf.tau
+        ax.set_xlabel(r"$q$", fontsize=fs_labels)
+        ax.set_ylabel(r"$\tau(q)$", fontsize=fs_labels)
+
+        for i, (mf, label) in enumerate(zip(mf_list, labels)):
+            if not (hasattr(mf, "q_dense") and hasattr(mf, "tau")):
+                print(f"[WARN] {label}: faltan q_dense/tau. Ejecuta plot_hq(..., interpolate_method=...) + compute_tau().")
+                continue
+            color = cmap(i % cmap.N)
+            ax.plot(mf.q_dense, mf.tau,
+                    marker=default_marker, markersize=default_ms,
+                    linestyle=default_linestyle, linewidth=default_linewidth,
+                    color=color, alpha=default_alpha, label=label, **kwargs)
+
+    elif what_norm in ("spectrum", "f(alpha)", "f_vs_alpha", "falfa", "falpha"):
+        # Requiere mf.alpha y mf.f_alpha
+        ax.set_xlabel(r"$\alpha$", fontsize=fs_labels)
+        ax.set_ylabel(r"$f(\alpha)$", fontsize=fs_labels)
+
+        for i, (mf, label) in enumerate(zip(mf_list, labels)):
+            if not (hasattr(mf, "alpha") and hasattr(mf, "f_alpha")):
+                print(f"[WARN] {label}: faltan alpha/f_alpha. Ejecuta compute_singularity_spectrum().")
+                continue
+            color = cmap(i % cmap.N)
+            ax.plot(mf.alpha, mf.f_alpha,
+                    marker=default_marker, markersize=default_ms,
+                    linestyle=default_linestyle, linewidth=default_linewidth,
+                    color=color, alpha=default_alpha, label=label, **kwargs)
+
+    else:
+        raise ValueError(
+            "Valor de 'what' no reconocido. Usa: 'hq', 'tau', 'spectrum', 'Dq', o 'fluctuations'."
+        )
+
+    ax.grid(True, which='both', linestyle='--', alpha=0.3)
+    if legend:
+        ax.legend(fontsize=fs_legend)
+    fig.tight_layout()
+
+    if created_fig:
+        plt.show()
+    return fig, ax
+
+
 class MultiFractality:
     def __init__(self, time_series):
         """
@@ -209,7 +361,7 @@ class MultiFractality:
 
 
 
-    def fit_hq(self, q=None, s_min=10, s_max=1000):
+    def fit_hq(self, q=None, s_min=10, s_max=1000, show_info=True):
         """
         Ajusta una recta log-log a F(s) vs s entre s_min y s_max,
         y devuelve la pendiente h(q) para cada q especificado o para todos los q disponibles.
@@ -260,9 +412,8 @@ class MultiFractality:
                 "intercept": A,
                 "range": (s_min, s_max)
             })
-
-            print(f"[INFO] Fit for q={q_val}: h(q) = {h_q:.4f} ± {error_h:.4f}")
-
+            if show_info:
+                print(f"[INFO] Fit for q={q_val}: h(q) = {h_q:.4f} ± {error_h:.4f}")
 
 
     def plot_fit_hq(self, q=None, correction=1.0, fs_legend=10,
@@ -386,7 +537,7 @@ class MultiFractality:
                     D0 = 0
                     popt, _ = curve_fit(arccot, qs, hqs, p0=[A0, B0, C0, D0], maxfev=10000)
                     hq_dense = arccot(q_dense, *popt)
-                    label_interp = r"Cotangent fit"
+                    label_interp = r"Arccotangent fit"
                 except RuntimeError:
                     raise RuntimeError("No se pudo ajustar la función cotangente. Intenta con otro método o revisa los datos.")
 
@@ -458,7 +609,7 @@ class MultiFractality:
         - f_alpha: array con f(α)
         """
         assert hasattr(self, "tau") and hasattr(self, "q_dense"), \
-            "Debes ejecutar compute_tau() antes de calcular f(α)"
+            "Must execute compute_tau() before compute f(α)"
 
         # Derivada de τ(q) respecto a q → α(q)
         dq = np.gradient(self.q_dense)
