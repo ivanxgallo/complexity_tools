@@ -192,7 +192,7 @@ def compare_multifractal_attribute(
 
     else:
         raise ValueError(
-            "Valor de 'what' no reconocido. Usa: 'hq', 'tau', 'spectrum', 'Dq', o 'fluctuations'."
+            "Value of 'what' not recognized. Use: 'hq', 'tau', or 'spectrum'."
         )
 
     ax.grid(True, which='both', linestyle='--', alpha=0.3)
@@ -214,8 +214,9 @@ class MultiFractality:
         self.mfdfa_results = {}
         assert self.series.ndim == 1, "La serie de tiempo debe ser unidimensional"
 
+
     def plot_time_series(self, xlabel="Time", ylabel="Value",
-                        xlog=False, ylog=False, **kwargs):
+                        xlog=False, ylog=False, savepath=None, **kwargs):
         """
         Grafica la serie de tiempo original.
 
@@ -245,6 +246,8 @@ class MultiFractality:
         if 'label' in kwargs:
             plt.legend(fontsize=kwargs.pop('fs_legend', 10))
         plt.tight_layout()
+        if savepath:
+            plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
         plt.show()
 
 
@@ -300,7 +303,7 @@ class MultiFractality:
 
     def plot_fluctuations(self, q=None, loglog=True, cmap_name='tab10',
                         fs_labels=12, fs_legend=10, legend=True,
-                        xlim=None, ylim=None, **kwargs):
+                        xlim=None, ylim=None, savepath=None, **kwargs):
         """
         Grafica F_q(s) vs s para uno o varios valores de q.
 
@@ -357,8 +360,9 @@ class MultiFractality:
         if legend:
             plt.legend(fontsize=fs_legend)
         plt.tight_layout()
+        if savepath:
+            plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
         plt.show()
-
 
 
     def fit_hq(self, q=None, s_min=10, s_max=1000, show_info=True):
@@ -417,7 +421,7 @@ class MultiFractality:
 
 
     def plot_fit_hq(self, q=None, correction=1.0, fs_legend=10,
-                    legend=True, cmap_name='tab20', **kwargs):
+                    legend=True, cmap_name='tab20', savepath=None, **kwargs):
         """
         Plotea F_q(s) vs s y su ajuste para uno o varios valores de q ajustados anteriormente.
 
@@ -472,14 +476,15 @@ class MultiFractality:
             plt.legend(fontsize=fs_legend)
         plt.grid(True, which='both', linestyle='--', alpha=0.3)
         plt.tight_layout()
+        if savepath:
+            plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
         plt.show()
-
 
 
     def plot_hq(self, marker='o', color='tab:blue', fs_labels=12,
                 fs_legend=10, interpolate_method=None, interpolate_marker='-',
                 poly_degree=3, num_points=300, ms_interpolate=5,
-                spline_smooth=0.5, interpolate_order='cubic', **kwargs):
+                spline_smooth=0.5, interpolate_order='cubic', savepath=None, **kwargs):
         """
         Grafica h(q) vs q con opción de interpolar la curva.
 
@@ -556,10 +561,12 @@ class MultiFractality:
         plt.grid(True, linestyle='--', alpha=0.3)
         plt.tight_layout()
         plt.legend(fontsize=fs_legend)
+        if savepath:
+            plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
         plt.show()
 
 
-    def compute_tau(self, plot=False, **kwargs):
+    def compute_tau(self, plot=False, savepath=None, **kwargs):
         """
         Calcula la función tau(q) = h(q) * q - 1 para todos los q calculados.
 
@@ -588,13 +595,15 @@ class MultiFractality:
             plt.grid(True, which='both', linestyle='--', alpha=0.3)
             plt.legend()
             plt.tight_layout()
+            if savepath:
+                plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
             plt.show()
 
         else:
             return self.q_dense, self.tau
 
 
-    def compute_singularity_spectrum(self, plot=False, output_range=[None, None], **kwargs):
+    def compute_singularity_spectrum(self, plot=False, output_range=[None, None], savepath=None, **kwargs):
         """
         Calcula el espectro de singularidades f(α) vs α a partir de τ(q).
 
@@ -636,6 +645,8 @@ class MultiFractality:
             plt.grid(True, which='both', linestyle='--', alpha=0.3)
             plt.legend(fontsize=kwargs.pop('fs_legend', 10))
             plt.tight_layout()
+            if savepath:
+                plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
             plt.show()
 
         else:
