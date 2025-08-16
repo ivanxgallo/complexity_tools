@@ -233,10 +233,13 @@ class MultiFractality:
                 linewidth=kwargs.pop('linewidth', 1.2),
                 marker=kwargs.pop('marker', ''),
                 alpha=kwargs.pop('alpha', 0.9),
-                label=kwargs.pop('label', None),
-                **kwargs)
-        plt.xlabel(xlabel, fontsize=kwargs.pop('fs_labels', 12))
-        plt.ylabel(ylabel, fontsize=kwargs.pop('fs_labels', 12))
+                label=kwargs.pop('label', None))
+        fs_label = kwargs.pop('fs_labels', 14)
+        plt.xlabel(xlabel, fontsize=fs_label)
+        plt.ylabel(ylabel, fontsize=fs_label)
+        fs_tick = kwargs.pop('fs_ticks', 14)
+        plt.xticks(fontsize=fs_tick)
+        plt.yticks(fontsize=fs_tick)
         plt.grid(True, linestyle='--', alpha=0.3)
 
         if xlog:
