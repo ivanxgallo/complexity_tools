@@ -707,41 +707,74 @@ class MultiFractality:
             return Dq
 
 
-    def compute_D0(self, method="max"):
+    def get_D(self, q=0, D0_method="limit"):
         """
-        Calcula D_0 con distintos métodos.
+        Devuelve el valor de D(q) para uno o varios valores de q.
+
+        - Si q = 1, evalúa el límite usando vecinos laterales.
+        - Si q = 0, puede usar el método 'limit' (por tau(q)) o 'max_falpha'.
+        - Si q es escalar, devuelve un escalar.
+        - Si q es iterable, devuelve una lista con D(q_i) para cada q_i.
 
         Parámetros:
-        - method: "max" usa max(f(α)), "limit" usa lim q→0 de D_q
+        - q: valor escalar o lista de valores
+        - D0_method: 'limit' (por tau) o 'max_falpha' (por f(alpha)) solo cuando q = 0
 
-        Retorna:
-        - D_0: valor escalar
+        Requiere:
+        - Haber ejecutado compute_Dq() previamente.
+        - Para D0_method='max_falpha', haber ejecutado compute_singularity_spectrum().
         """
-        if method == "max":
-            assert hasattr(self, "f_alpha"), "Debes calcular f(α) primero con compute_singularity_spectrum()."
-            D0 = np.nanmax(self.f_alpha)
+        import warnings
 
-        elif method == "limit":
-            assert hasattr(self, "Dq"), "Debes calcular D_q primero con compute_Dq()."
-            assert hasattr(self, "q_dense"), "Faltan los valores de q para D_q."
+        assert hasattr(self, "Dq"), "Must execute compute_Dq() first."
+        assert hasattr(self, "q_dense"), "Not found q_dense. Run plot_hq() first with interpolate_method."
 
-            q_vals = self.q_dense
-            D_vals = self.Dq
+        q_array = np.atleast_1d(q)
+        D_list = []
 
-            # Seleccionar valores cercanos a q=0 (ej. -0.5 < q < 0.5, excluyendo q=0)
-            mask = (q_vals > -0.5) & (q_vals < 0.5) & (~np.isclose(q_vals, 0))
+        for q_i in q_array:
+            # === Caso especial q = 1 ===
+            if np.isclose(q_i, 1.0):
+                q_vals = self.q_dense
+                D_vals = self.Dq
+                idx = np.argmin(np.abs(q_vals - 1.0))
+                if 0 < idx < len(q_vals) - 1:
+                    D_left = D_vals[idx - 1]
+                    D_right = D_vals[idx + 1]
+                    D1 = (D_left + D_right) / 2
+                else:
+                    warnings.warn("No se puede interpolar D(1) por falta de vecinos.")
+                    D1 = np.nan
+                D_list.append(D1)
 
-            if np.sum(mask) < 2:
-                raise ValueError("No hay suficientes puntos cercanos a q=0 para calcular el límite.")
+            # === Caso especial q = 0 ===
+            elif np.isclose(q_i, 0.0):
+                if D0_method == "limit":
+                    q_vals = self.q_dense
+                    D_vals = self.Dq
+                    mask = (q_vals > -0.5) & (q_vals < 0.5) & (~np.isclose(q_vals, 0.0))
+                    if np.sum(mask) < 2:
+                        raise ValueError("No hay suficientes puntos cercanos a q=0 para calcular el límite.")
+                    fit = np.polyfit(q_vals[mask], D_vals[mask], deg=1)
+                    D0 = fit[1]  # Intercepto ≈ D(0)
+                    D_list.append(D0)
+                elif D0_method == "max_falpha":
+                    assert hasattr(self, "f_alpha"), \
+                        "Debes calcular f(α) primero con compute_singularity_spectrum()."
+                    D0 = np.nanmax(self.f_alpha)
+                    D_list.append(D0)
+                else:
+                    raise ValueError("D0_method debe ser 'limit' o 'max_falpha'.")
 
-            fit = np.polyfit(q_vals[mask], D_vals[mask], deg=1)
-            D0 = fit[1]  # Intercepto ≈ D_q(q=0)
+            # === Casos regulares ===
+            else:
+                try:
+                    idx = np.argmin(np.abs(self.q_dense - q_i))
+                    D_list.append(self.Dq[idx])
+                except Exception:
+                    D_list.append(np.nan)
 
-        else:
-            raise ValueError("Método inválido. Usa 'max' o 'limit'.")
-
-        self.D0 = D0
-        return D0
+        return D_list[0] if np.ndim(q) == 0 else D_list
 
 
     def remove_q_results(self, q):
