@@ -59,10 +59,12 @@ def compare_multifractal_attribute(
     labels=None,
     cmap_name="tab20",
     fs_labels=15,
-    fs_legend=10,
+    fs_legend=15,
+    fs_ticks=15,
     legend=True,
     include_errors=True,
     ax=None,
+    savepath=None,
     **kwargs
 ):
     """
@@ -198,7 +200,11 @@ def compare_multifractal_attribute(
     ax.grid(True, which='both', linestyle='--', alpha=0.3)
     if legend:
         ax.legend(fontsize=fs_legend)
+
+    ax.tick_params(axis='both', which='major', labelsize=fs_ticks)
     fig.tight_layout()
+    if savepath:
+        plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
 
     if created_fig:
         plt.show()

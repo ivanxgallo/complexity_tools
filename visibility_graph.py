@@ -363,7 +363,7 @@ class VisibilityGraph:
 
     def fit_degree_slope(self, kind='total', k_min=10, k_max=100,
                         plot=True, store=True, correction=1.1,
-                        log_x=True, log_y=True, title=True, **kwargs):
+                        log_x=True, log_y=True, title=True, savepath=None, **kwargs):
         """
         Ajusta una recta a la distribución P(k) vs k transformando opcionalmente los ejes.
 
@@ -460,6 +460,8 @@ class VisibilityGraph:
             plt.legend()
             plt.grid(True, which='both', linestyle='--', alpha=0.4)
             plt.tight_layout()
+            if savepath:
+                plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
             plt.show()
 
         print(f"[INFO] Ajuste para '{kind}': pendiente = {slope:.4f} ± {error:.4f}")
@@ -469,7 +471,7 @@ class VisibilityGraph:
 
     def plot_time_series(self, xlabel="Time", ylabel="Value",
                         title="Time Series", xlog=False, ylog=False,
-                        xlim=None, ylim=None, **kwargs):
+                        xlim=None, ylim=None, savepath=None, **kwargs):
         """
         Grafica la serie de tiempo original entregada a la clase.
 
@@ -520,4 +522,6 @@ class VisibilityGraph:
         plt.yticks(fontsize=kwargs.pop('yticksize', None))
 
         plt.tight_layout()
+        if savepath:
+            plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
         plt.show()
