@@ -79,14 +79,147 @@ def _render_map_frame(task):
     return task["out_path"]
 
 
+def geo_to_local_cartesian(
+    df: pd.DataFrame,
+    *,
+    lon_col: str = "longitude",
+    lat_col: str = "latitude",
+    depth_col: str | None = None,   # si None -> Z = 0
+    ref: str | tuple = "auto",      # "auto" o (lon0_deg, lat0_deg[, h0_km])  (h0_km ignorado aquí)
+    radius_km: float = 6371.0,      # radio terrestre efectivo
+    depth_unit: str = "km",         # "km" o "m"
+    depth_positive_down: bool = True,
+    unwrap_dateline: bool = False,  # desenvuelve longitudes si estás cerca de ±180°
+    out_cols: tuple[str,str,str] = ("X","Y","Z"),
+    inplace: bool = False
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Convierte (lon, lat, depth) a un sistema cartesiano local (X,Y,Z) en km
+    usando una aproximación equirectangular alrededor de un origen (lon0,lat0).
+
+    - X ≈ R cos(lat0) · (lon - lon0)   (con ángulos en rad)
+    - Y ≈ R · (lat - lat0)
+    - Z  a partir de depth (opcional): si depth_positive_down=True => Z = depth_km
+
+    Parámetros
+    ----------
+    df : DataFrame con columnas lon_col, lat_col y opcionalmente depth_col.
+    ref : "auto" o (lon0_deg, lat0_deg[, h0_km]). Si "auto", usa la mediana.
+    depth_unit : "km" o "m".
+    unwrap_dateline : si True, usa np.unwrap sobre las longitudes en radianes.
+
+    Retorna
+    -------
+    (df_out, meta)
+        df_out : DataFrame (copia salvo que inplace=True) con columnas X,Y,Z (en km).
+        meta   : dict con {'lon0_deg','lat0_deg','radius_km','depth_unit','depth_positive_down'}
+    """
+    if not inplace:
+        df = df.copy()
+
+    # --- Extraer columnas y validar ---
+    if lon_col not in df.columns or lat_col not in df.columns:
+        raise ValueError(f"DataFrame must contain '{lon_col}' and '{lat_col}' columns.")
+    lon = df[lon_col].to_numpy(dtype=float)
+    lat = df[lat_col].to_numpy(dtype=float)
+
+    # Manejo de NaNs: máscara de válidos para lon/lat
+    mask_xy = np.isfinite(lon) & np.isfinite(lat)
+
+    # --- Definir origen (lon0, lat0) en grados ---
+    if ref == "auto":
+        # Usar mediana robusta de los válidos
+        if not mask_xy.any():
+            raise ValueError("No valid lon/lat values to determine reference origin.")
+        lon0_deg = float(np.nanmedian(lon[mask_xy]))
+        lat0_deg = float(np.nanmedian(lat[mask_xy]))
+    elif isinstance(ref, (tuple, list)) and (len(ref) >= 2):
+        lon0_deg = float(ref[0])
+        lat0_deg = float(ref[1])
+    else:
+        raise ValueError("ref must be 'auto' or a tuple (lon0_deg, lat0_deg[, h0_km]).")
+
+    # --- Convertir a radianes ---
+    lon_rad = np.deg2rad(lon)
+    lat_rad = np.deg2rad(lat)
+    lon0_rad = np.deg2rad(lon0_deg)
+    lat0_rad = np.deg2rad(lat0_deg)
+
+    # Opcionalmente desenvolver (útil si se cruza el dateline)
+    if unwrap_dateline:
+        lon_rad = np.unwrap(lon_rad)
+
+    # --- Diferencias angulares respecto al origen ---
+    dlon = lon_rad - lon0_rad
+    dlat = lat_rad - lat0_rad
+
+    # --- Proyección equirectangular local ---
+    cos_lat0 = np.cos(lat0_rad)
+    X = np.full(lon.shape, np.nan, dtype=float)
+    Y = np.full(lat.shape, np.nan, dtype=float)
+
+    X[mask_xy] = radius_km * cos_lat0 * dlon[mask_xy]
+    Y[mask_xy] = radius_km * dlat[mask_xy]
+
+    # --- Z desde profundidad (opcional) ---
+    if depth_col is None or depth_col not in df.columns:
+        Z = np.zeros(lon.shape, dtype=float)
+    else:
+        depth = df[depth_col].to_numpy(dtype=float)
+        mask_z = np.isfinite(depth)
+        Z = np.full(depth.shape, np.nan, dtype=float)
+
+        # Convertir a km si viene en metros
+        depth_km = depth if depth_unit == "km" else (depth / 1000.0)
+
+        if depth_positive_down:
+            Z[mask_z] = depth_km[mask_z]          # profundidad positiva hacia abajo
+        else:
+            Z[mask_z] = -depth_km[mask_z]         # altitud positiva hacia arriba
+
+        # Si hay lon/lat NaN, deja Z como NaN también para consistencia
+        Z[~mask_xy] = np.nan
+
+    # --- Escribir en el DataFrame ---
+    x_col, y_col, z_col = out_cols
+    df[x_col] = X
+    df[y_col] = Y
+    df[z_col] = Z
+
+    meta = dict(
+        lon0_deg=lon0_deg,
+        lat0_deg=lat0_deg,
+        radius_km=radius_km,
+        depth_unit=depth_unit,
+        depth_positive_down=depth_positive_down,
+        unwrap_dateline=unwrap_dateline,
+        method="equirect"
+    )
+    return df, meta
+
+
 # ---------------- POINT PROCESS NETWORK ---------------- #
 class PointProcessNetwork:
-    def __init__(self, dim=2, directed=False, df=None, time_col=None, space_cols=None):
+    def __init__(self,
+                dim=2,
+                directed=False,
+                df=None,
+                time_col=None,
+                space_cols=['longitude','latitude','depth'],
+                # Parámetros de geo_to_local_cartesian
+                to_cartesian=True,
+                cartesian_ref='auto',        # o (lon0, lat0, h0)
+                cartesian_method='equirect', # o 'enu-pyproj' | 'utm'
+                depth_col='depth',
+                depth_unit='km',
+                depth_positive_down=True
+                ):
         if space_cols:
             if isinstance(space_cols, str):
                 space_cols = [space_cols]
             assert len(space_cols) == dim, f"Expected {dim} spatial columns, but got {len(space_cols)}."
         self.dim = dim
+        self.to_cartesian = to_cartesian
         self.events = None
         self.grid = None
         self.graph = nx.DiGraph() if directed else nx.Graph()
@@ -97,10 +230,33 @@ class PointProcessNetwork:
                 df.insert(0, 't_counter', range(1, len(df) + 1))
                 time_col = 't_counter'
                 print(f"[INFO] Time column is not specified. Using '{time_col}' as time index.")
-            self.load_events_from_df(df, time_col, space_cols)
+            self.load_events_from_df(df, time_col, space_cols, depth_unit=depth_unit)
 
 
-    def load_events_from_df(self, df, time_col='t', space_cols=None):
+    def _cart_to_geo(self, X, Y):
+        """
+        Inversa de la proyección equirectangular local usada en geo_to_local_cartesian.
+        Retorna (lon_deg, lat_deg) a partir de (X,Y) en km.
+        Requiere self.meta con lon0_deg, lat0_deg, radius_km.
+        """
+        if not hasattr(self, "meta") or self.meta is None:
+            raise ValueError("No 'meta' found for inverse transform. Did you convert to cartesian?")
+        lon0_deg = self.meta["lon0_deg"]
+        lat0_deg = self.meta["lat0_deg"]
+        R        = self.meta["radius_km"]
+        lon0     = np.deg2rad(lon0_deg)
+        lat0     = np.deg2rad(lat0_deg)
+        coslat0  = np.cos(lat0)
+
+        dlon = X / (R * coslat0)        # rad
+        dlat = Y / R                    # rad
+
+        lon = lon0 + dlon
+        lat = lat0 + dlat
+        return (np.rad2deg(lon), np.rad2deg(lat))
+
+
+    def load_events_from_df(self, df, time_col='t', space_cols=None, depth_unit='km'):
         """
         Carga eventos desde un DataFrame.
         """
@@ -110,6 +266,20 @@ class PointProcessNetwork:
         self.events = df[[time_col] + space_cols].sort_values(by=time_col).reset_index(drop=True)
         self.time_col = time_col
         self.space_cols = space_cols
+
+        # Convertir a coordenadas cartesianas locales
+        if self.to_cartesian:
+            self.events, meta = geo_to_local_cartesian(
+                self.events,
+                lon_col=space_cols[0],
+                lat_col=space_cols[1],
+                depth_col=space_cols[2] if len(space_cols) > 2 else None,
+                ref='auto' if isinstance(self.to_cartesian, bool) else self.to_cartesian,
+                radius_km=6371.0,  # Radio terrestre efectivo
+                depth_unit=depth_unit,
+                depth_positive_down=True
+            )
+            self.meta = meta
 
 
     def load_events_from_csv(self, filepath, time_col='t', space_cols=None, sep=" ", n_data=None):
@@ -130,27 +300,34 @@ class PointProcessNetwork:
 
     def create_grid(self, cell_size):
         """
-        Crea una grilla con celdas cuadradas (o cúbicas) de lado fijo `cell_size`.
-
-        Parámetros:
-        - cell_size: tamaño del lado de las celdas en cada eje (float)
+        Crea grilla cuadrada/cúbica de lado 'cell_size' (en km si to_cartesian=True).
         """
-
         assert self.events is not None, "Debes cargar eventos antes de crear la grilla"
 
-        coords = self.events.iloc[:, 1:].values
-        mins = coords.min(axis=0)
-        maxs = coords.max(axis=0)
-        sizes = maxs - mins
+        # --- Elegir coordenadas para el binning ---
+        if getattr(self, "to_cartesian", False) and {"X","Y"}.issubset(self.events.columns):
+            if self.dim == 3 and "Z" in self.events.columns:
+                coords = self.events[["X","Y","Z"]].to_numpy(float)
+            else:
+                coords = self.events[["X","Y"]].to_numpy(float)
+        else:
+            # binning en el espacio original (p.ej. lon/lat en grados)
+            coords = self.events.iloc[:, 1:].to_numpy(float)
 
-        num_cells = np.ceil(sizes / cell_size).astype(int)
+        mins  = np.nanmin(coords, axis=0)
+        maxs  = np.nanmax(coords, axis=0)
+        sizes = np.maximum(maxs - mins, 0.0)
+
+        # al menos 1 celda por eje para evitar errores con idx+1
+        num_cells = np.maximum(np.ceil(sizes / float(cell_size)).astype(int), 1)
+
         edges = [
-            np.linspace(mins[i], mins[i] + num_cells[i] * cell_size, num_cells[i] + 1)
+            np.linspace(mins[i], mins[i] + num_cells[i] * float(cell_size), num_cells[i] + 1)
             for i in range(self.dim)
         ]
 
         self.grid = {
-            'cell_size': cell_size,
+            'cell_size': float(cell_size),
             'mins': mins,
             'maxs': maxs,
             'num_cells': num_cells,
@@ -174,21 +351,52 @@ class PointProcessNetwork:
 
     def build_sequential_graph(self):
         """
-        Construye un grafo secuencial: cada nodo es una celda,
-        y las aristas siguen el orden temporal de los eventos.
+        Construye grafo secuencial: binning en coordenadas cartesianas si to_cartesian=True,
+        pero guarda 'pos' de los nodos en (lon, lat) para plotear en mapa.
         """
-        coords = self.events.iloc[:, 1:].values
+        # --- coords para localizar celdas ---
+        if getattr(self, "to_cartesian", False) and {"X","Y"}.issubset(self.events.columns):
+            if self.dim == 3 and "Z" in self.events.columns:
+                coords = self.events[["X","Y","Z"]].to_numpy(float)
+            else:
+                coords = self.events[["X","Y"]].to_numpy(float)
+            use_cartesian = True
+        else:
+            coords = self.events.iloc[:, 1:].to_numpy(float)
+            use_cartesian = False
+
         prev_cell = None
         for x in tqdm(coords, leave=False, desc="Build a Graph"):
             cell = self.locate_event_cell(x)
+
             if cell not in self.graph:
-                # Calcular centro de la celda
-                center = []
+                # centro de la celda en el sistema de la grilla (cart o no)
+                center_cart = []
                 for i, idx in enumerate(cell):
                     edge_start = self.grid['edges'][i][idx]
-                    edge_end = self.grid['edges'][i][idx + 1]
-                    center.append(0.5 * (edge_start + edge_end))
-                self.graph.add_node(cell, pos=tuple(center))
+                    edge_end   = self.grid['edges'][i][idx + 1]
+                    center_cart.append(0.5 * (edge_start + edge_end))
+
+                # preparar atributos de nodo
+                attrs = {}
+
+                if use_cartesian:
+                    # guardar centro cartesiano
+                    attrs['pos_cart'] = tuple(center_cart)
+
+                    # invertir a lon/lat para 'pos'
+                    lon, lat = self._cart_to_geo(center_cart[0], center_cart[1])
+                    attrs['pos'] = (lon, lat)
+                else:
+                    # si la grilla está en el mismo sistema que se plotea (p.ej. lon/lat)
+                    if self.dim >= 2:
+                        attrs['pos'] = (center_cart[0], center_cart[1])
+                    else:
+                        # dim=1 no ploteable en mapa; igual guardamos algo razonable
+                        attrs['pos'] = (center_cart[0], 0.0)
+
+                self.graph.add_node(cell, **attrs)
+
             if prev_cell is not None:
                 self.graph.add_edge(prev_cell, cell)
             prev_cell = cell
@@ -646,8 +854,16 @@ class PointProcessNetwork:
 
 # ---------------- Evolving Network ---------------- #
 class EvolvingNetwork:
-    def __init__(self, point_process_df, time_col='t', space_cols=None,
-                    dim=2, directed=False, timestamp_method='mean', save_graphs=False):
+    def __init__(self,
+                point_process_df,
+                time_col='t',
+                space_cols=None,
+                dim=2,
+                directed=False,
+                timestamp_method='mean',
+                save_graphs=False,
+                to_cartesian=False
+                ):
         # --- Normalización de space_cols ---
         if space_cols is None:
             # si no te pasan space_cols, tomamos todas menos la de tiempo (si existe)
@@ -693,6 +909,7 @@ class EvolvingNetwork:
         self.stats = []
         self.graphs = []
         self.save_graph = save_graphs
+        self.to_cartesian = to_cartesian
 
 
     def _compute_timestamp(self, series):
@@ -751,7 +968,10 @@ class EvolvingNetwork:
             try:
                 timestamp = self._compute_timestamp(window_df[self.time_col])
 
-                ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
+                ppn = PointProcessNetwork(dim=self.dim,
+                                        directed=self.directed,
+                                        to_cartesian=self.to_cartesian
+                                        )
                 ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
                 ppn.create_grid(cell_size)
                 ppn.build_sequential_graph()
@@ -780,7 +1000,10 @@ class EvolvingNetwork:
             window_df = self.df.iloc[start:end]
             timestamp = self._compute_timestamp(window_df[self.time_col])
 
-            ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
+            ppn = PointProcessNetwork(dim=self.dim,
+                                    directed=self.directed,
+                                    to_cartesian=self.to_cartesian
+                                    )
             ppn.load_events_from_df(window_df, time_col=self.time_col, space_cols=self.space_cols)
             ppn.create_grid(cell_size)
             ppn.build_sequential_graph()
