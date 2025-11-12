@@ -64,7 +64,12 @@ def compare_multifractal_attribute(
     legend=True,
     include_errors=True,
     ax=None,
+    xlim=None,
+    ylim=None,
+    xlabel=None,
+    ylabel=None,
     savepath=None,
+    correction=1.0,
     **kwargs
 ):
     """
@@ -131,8 +136,14 @@ def compare_multifractal_attribute(
     if what_norm in ("hq", "h(q)", "hq_vs_q", "h_vs_q"):
         # Cada objeto necesita mfdfa_results con 'h' y 'error_h' por q.
         # Se plotea h(q) vs q. Si include_errors, usa barras de error.
-        ax.set_xlabel(r"$q$", fontsize=fs_labels)
-        ax.set_ylabel(r"$h(q)$", fontsize=fs_labels)
+        if xlabel is None:
+            ax.set_xlabel(r"$q$", fontsize=fs_labels)
+        else:
+            ax.set_xlabel(xlabel, fontsize=fs_labels)
+        if ylabel is None:
+            ax.set_ylabel(r"$h(q)$", fontsize=fs_labels)
+        else:
+            ax.set_ylabel(ylabel, fontsize=fs_labels)
 
         for i, (mf, label) in enumerate(zip(mf_list, labels)):
             if not hasattr(mf, "mfdfa_results") or len(mf.mfdfa_results) == 0:
@@ -146,7 +157,8 @@ def compare_multifractal_attribute(
                 continue
 
             qs = sorted(qs)
-            hqs = np.array([mf.mfdfa_results[q]['h'] for q in qs])
+            corr = correction if correction is not None else 0
+            hqs = np.array([mf.mfdfa_results[q]['h'] for q in qs]) + corr
             errs = np.array([mf.mfdfa_results[q].get('error_h', np.nan) for q in qs])
 
             color = cmap(i % cmap.N)
@@ -202,6 +214,8 @@ def compare_multifractal_attribute(
         ax.legend(fontsize=fs_legend)
 
     ax.tick_params(axis='both', which='major', labelsize=fs_ticks)
+    plt.ylim(ylim)
+    plt.xlim(xlim)
     fig.tight_layout()
     if savepath:
         plt.savefig(savepath, dpi=kwargs.pop('dpi', 200))
@@ -261,7 +275,8 @@ class MultiFractality:
 
 
     def mfdfa(self, q=2, min_scale=10, max_scale=1000,
-                n_scales=50, order=1, double=False, parallel=True):
+                n_scales=50, order=1, double=False,
+                leave=True, parallel=True):
         """
         Aplica el algoritmo MFDFA a la serie de tiempo para uno o varios valores de q.
 
@@ -294,7 +309,8 @@ class MultiFractality:
                     for q_val in q_list
                 }
 
-                for future in tqdm(as_completed(futures), total=len(futures), desc="MFDFA parallel"):
+                for future in tqdm(as_completed(futures), total=len(futures),
+                                    desc="MFDFA parallel", leave=leave):
                     q_val, s_vals, flucts = future.result()
                     self.mfdfa_results[q_val] = {
                         "scales": s_vals,
@@ -302,7 +318,7 @@ class MultiFractality:
                     }
 
         else:
-            for q_val in tqdm(q_list, desc="MFDFA sequential"):
+            for q_val in tqdm(q_list, desc="MFDFA sequential", leave=leave):
                 q_val, s_vals, flucts = _compute_mfdfa_single_q(ts, profile, scales, q_val, order, double)
                 self.mfdfa_results[q_val] = {
                     "scales": s_vals,
@@ -430,7 +446,9 @@ class MultiFractality:
 
 
     def plot_fit_hq(self, q=None, correction=1.0, fs_legend=10,
-                    legend=True, cmap_name='tab20', savepath=None, **kwargs):
+                    legend=True, cmap_name='tab20', savepath=None,
+                    fs_labels=18, fs_ticks=18, loc=None,
+                    ylim=None, xlim=None, alpha=0.8, **kwargs):
         """
         Plotea F_q(s) vs s y su ajuste para uno o varios valores de q ajustados anteriormente.
 
@@ -474,15 +492,19 @@ class MultiFractality:
             F_fit = correction * A * s_fit ** h_q
 
             # Plot datos y ajuste
-            plt.plot(s, correction * F, 'o-', label=fr"Data $q={q_val}$", color=color, alpha=0.5)
+            plt.plot(s, F, 'o-', label=fr"Data $q={q_val}$", color=color, alpha=alpha)
             plt.plot(s_fit, F_fit, 'k-', label=fr"$q={q_val}$ fit: $s^{{{h_q:.2f}}}$")
 
         plt.xscale('log')
         plt.yscale('log')
-        plt.xlabel(r"$s$")
-        plt.ylabel(r"$F_q(s)$")
+        plt.xlabel(r"$s$", fontsize=fs_labels)
+        plt.ylabel(r"$F_q(s)$", fontsize=fs_labels)
+        plt.xticks(fontsize=fs_ticks)
+        plt.yticks(fontsize=fs_ticks)
+        plt.ylim(ylim)
+        plt.xlim(xlim)
         if legend:
-            plt.legend(fontsize=fs_legend)
+            plt.legend(fontsize=fs_legend, loc=loc)
         plt.grid(True, which='both', linestyle='--', alpha=0.3)
         plt.tight_layout()
         if savepath:
