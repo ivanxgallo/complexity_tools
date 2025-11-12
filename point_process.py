@@ -79,7 +79,8 @@ def _render_map_frame(task):
     return task["out_path"]
 
 
-# ---------------- POINT PROCESS NETWORK ---------------- #
+# ----------------------------------------- POINT PROCESS NETWORK ------------------------------------------ #
+
 class PointProcessNetwork:
     def __init__(self, dim=2, directed=False, df=None, time_col=None, space_cols=None):
         if space_cols:
@@ -644,7 +645,377 @@ class PointProcessNetwork:
         return pd.Series(values, index=pd.to_datetime(times), name=attribute)
 
 
-# ---------------- Evolving Network ---------------- #
+    def average_neighbor_degree_by_k(self):
+        """
+        Calcula k_nn(k): el promedio del grado de los vecinos de los nodos de grado k.
+
+        Guarda internamente:
+        - self.k_asort : lista de grados distintos
+        - self.knn     : lista del promedio del grado medio de los vecinos para cada k
+
+        Retorna
+        -------
+        tuple : (k_values, knn_values)
+            k_values: lista de grados distintos
+            knn_values: promedio del grado medio de los vecinos para cada k
+        """
+        if self.graph.number_of_nodes() == 0:
+            raise ValueError("Graph is empty. Build it first.")
+
+        # --- Grados de nodos ---
+        degrees = dict(self.graph.degree())
+
+        # --- Promedio del grado de los vecinos ---
+        knn_per_node = {}
+        for node in self.graph.nodes():
+            neighbors = list(self.graph.neighbors(node))
+            k_i = degrees[node]
+            if k_i > 0 and len(neighbors) > 0:
+                neighbor_degrees = [degrees[nbr] for nbr in neighbors]
+                knn_per_node[node] = np.mean(neighbor_degrees)
+            else:
+                knn_per_node[node] = np.nan  # nodos aislados o sin vecinos
+
+        # --- Agrupar por grado ---
+        knn_by_k = {}
+        for node, k_i in degrees.items():
+            k_nn_i = knn_per_node[node]
+            if np.isnan(k_nn_i):
+                continue
+            if k_i not in knn_by_k:
+                knn_by_k[k_i] = []
+            knn_by_k[k_i].append(k_nn_i)
+
+        self.k_asort = sorted(knn_by_k.keys())
+        self.knn = [np.mean(knn_by_k[k]) for k in self.k_asort]
+
+        return self.k_asort, self.knn
+
+
+    def plot_assortativity(self, loglog=True, xlim=None, ylim=None,
+                           dpi=200, figsize=(7,5), **kwargs):
+        """
+        Grafica la relación k_nn(k) vs k para evaluar la asortatividad estructural local.
+
+        Usa los valores calculados en average_neighbor_degree_by_k().
+        """
+        if not hasattr(self, "k_asort") or not hasattr(self, "knn"):
+            self.average_neighbor_degree_by_k()
+
+        plt.figure(dpi=dpi, figsize=figsize)
+        plt.plot(self.k_asort, self.knn, 'o-',
+                    color=kwargs.pop('color', 'steelblue'),
+                    label=r"$k_{nn}(k)$")
+
+        if loglog:
+            plt.xscale('log')
+            plt.yscale('log')
+
+        plt.xlabel(r"$k$", fontsize=kwargs.pop('fs_label', 15))
+        plt.ylabel(r"$\langle k_{nn}(k) \rangle$", fontsize=kwargs.pop('fs_label', 15))
+        plt.grid(True, which='both', linestyle='--', alpha=0.5)
+        plt.tight_layout()
+        plt.legend()
+        if xlim: plt.xlim(xlim)
+        if ylim: plt.ylim(ylim)
+        plt.show()
+
+
+    def global_assortativity(self):
+        """
+        Calcula la asortatividad global r (coeficiente de Pearson entre grados de nodos conectados).
+
+        Guarda internamente:
+        - self.r_global : float, coeficiente de asortatividad global.
+
+        Retorna
+        -------
+        float : valor del coeficiente global de asortatividad.
+        """
+        if self.graph.number_of_nodes() == 0:
+            raise ValueError("Graph is empty. Build it first.")
+
+        try:
+            self.r_global = nx.degree_assortativity_coefficient(self.graph)
+        except Exception as e:
+            self.r_global = np.nan
+            print(f"[WARN] Could not compute global assortativity: {e}")
+
+        return self.r_global
+
+
+    def detect_communities(self):
+        """
+        Detecta comunidades en el grafo usando el método de Louvain.
+
+        Guarda internamente:
+        - self.communities : dict {nodo: comunidad_id}
+        - self.community_sizes : dict {comunidad_id: número de nodos}
+        - self.communities_sorted : lista de tuplas (comunidad_id, tamaño) ordenadas por tamaño descendente.
+
+        Retorna
+        -------
+        dict : {nodo: comunidad_id}
+        """
+        if self.graph.number_of_nodes() == 0:
+            raise ValueError("Graph is empty. Build it first.")
+
+        try:
+            import community as community_louvain  # paquete 'python-louvain'
+        except ImportError:
+            raise ImportError("Debe instalar el paquete 'python-louvain': pip install python-louvain")
+
+        # --- Detección de comunidades ---
+        partition = community_louvain.best_partition(self.graph)
+        self.communities = partition
+
+        # --- Calcular tamaños ---
+        sizes = Counter(partition.values())
+        self.community_sizes = dict(sizes)
+
+        # --- Ordenar comunidades por tamaño ---
+        self.communities_sorted = sorted(sizes.items(), key=lambda x: x[1], reverse=True)
+
+        return self.communities
+
+
+    def get_community_summary(self, top=None):
+        """
+        Retorna el resumen de comunidades detectadas.
+
+        Parámetros
+        ----------
+        top : int | None
+            Si se indica, retorna solo las N comunidades más grandes.
+
+        Retorna
+        -------
+        dict : {comunidad_id: tamaño}
+        """
+        if not hasattr(self, "community_sizes"):
+            communities = self.detect_communities()
+
+        if top is None:
+            return self.community_sizes
+
+        top_communities = dict(self.communities_sorted[:top])
+        return top_communities
+
+
+    def plot_communities_on_map(self, ax=None, *,
+                                community_list=None,
+                                node_attribute="degree",
+                                percentile=None,
+                                percentile_mode="global",
+                                base_size=2.0,
+                                size_per_unit=1.0,
+                                edge_width=0.3,
+                                edge_alpha=0.25,
+                                node_edgecolor='black',
+                                contour_width=0.4,
+                                add_features=True,
+                                extent='auto',
+                                extent_margin=(1.0, 0.25),
+                                cities=None,
+                                city_size=70,
+                                city_color="gold",
+                                city_textsize=12,
+                                show_edges=True,
+                                base_size_legend=50,
+                                savepath=None,
+                                dpi=200, figsize=(6, 6),
+                                show=True):
+        """
+        Dibuja las comunidades sobre un mapa (lon, lat), coloreando por comunidad.
+
+        Parámetros
+        ----------
+        community_list : list[int] | None
+            IDs de comunidades a mostrar. Si None, se muestran todas.
+        node_attribute : str
+            Atributo de los nodos que define el tamaño ('degree', 'bc', etc.)
+        """
+        if not _HAS_CARTOPY:
+            raise ImportError("Cartopy is not installed. Use `pip install cartopy`")
+
+        if not hasattr(self, "communities"):
+            raise ValueError("Debe ejecutar detect_communities() primero.")
+
+        # Crear figura/ax si no viene uno
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(subplot_kw={'projection': ccrs.PlateCarree()},
+                                    dpi=dpi, figsize=figsize)
+            created_fig = True
+
+        # Posiciones de nodos
+        pos = nx.get_node_attributes(self.graph, 'pos')
+        if not pos:
+            raise ValueError("No hay posiciones 'pos' en los nodos. Llame a build_sequential_graph() antes.")
+
+        # Extent automático
+        if extent == 'auto':
+            lons = [p[0] for p in pos.values()]
+            lats = [p[1] for p in pos.values()]
+            if not lons:
+                raise ValueError("No hay nodos para determinar extent.")
+            dx, dy = extent_margin
+            extent = (min(lons) - dx, max(lons) + dx, min(lats) - dy, max(lats) + dy)
+        if extent is not None:
+            ax.set_extent(extent, crs=ccrs.PlateCarree())
+
+        # Features base
+        if add_features:
+            roads = NaturalEarthFeature(
+                category="cultural", name="roads", scale="10m", facecolor="none"
+            )
+            ax.add_feature(roads, edgecolor='red', linewidth=1, alpha=0.7)
+            ax.add_feature(cfeature.COASTLINE, linewidth=1)
+            ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5)
+            ax.add_feature(cfeature.LAND, facecolor='lightgray')
+            ax.add_feature(cfeature.OCEAN, facecolor='lightblue')
+            gl = ax.gridlines(draw_labels=True, color="gray", alpha=0.5, linestyle="--")
+            gl.top_labels = False
+            gl.right_labels = False
+
+        # Valores de atributo (para tamaño)
+        if node_attribute == "degree":
+            attr_values = dict(self.graph.degree())
+        else:
+            sample_node = next(iter(self.graph.nodes))
+            if node_attribute not in self.graph.nodes[sample_node]:
+                raise ValueError(f"El atributo '{node_attribute}' no está calculado en los nodos.")
+            attr_values = nx.get_node_attributes(self.graph, node_attribute)
+
+        # --- Filtro por percentil (adaptativo: global o local) ---
+        nodes_to_plot = list(self.graph.nodes)  # default
+        if percentile is not None:
+            if percentile_mode not in ("global", "local"):
+                raise ValueError("percentile_mode must be 'global' or 'local'")
+
+            if percentile_mode == "global":
+                # --- Global: se calcula un único umbral para toda la red ---
+                threshold = np.percentile(list(attr_values.values()), 100 - percentile)
+                nodes_to_plot = [n for n, v in attr_values.items() if v >= threshold]
+
+            elif percentile_mode == "local":
+                # --- Local: un umbral distinto por comunidad ---
+                nodes_to_plot = []
+                communities_in_plot = (
+                    community_list if community_list is not None
+                    else sorted(set(self.communities.values()))
+                )
+                for cid in communities_in_plot:
+                    members = [n for n, c in self.communities.items() if c == cid]
+                    values = [attr_values[n] for n in members if n in attr_values]
+                    if len(values) == 0:
+                        continue
+                    threshold = np.percentile(values, 100 - percentile)
+                    selected = [n for n in members if attr_values.get(n, 0) >= threshold]
+                    nodes_to_plot.extend(selected)
+
+        # Filtrar comunidades si se pide
+        if community_list is not None:
+            nodes_to_plot = [n for n in nodes_to_plot
+                                if self.communities.get(n) in community_list]
+
+        # Mostrar aristas
+        if show_edges:
+            for u, v in self.graph.edges():
+                if u in nodes_to_plot and v in nodes_to_plot:
+                    lon_u, lat_u = pos[u]
+                    lon_v, lat_v = pos[v]
+                    ax.plot([lon_u, lon_v], [lat_u, lat_v],
+                            transform=ccrs.PlateCarree(),
+                            linewidth=edge_width,
+                            color='black',
+                            alpha=edge_alpha,
+                            zorder=4)
+
+        # Paleta de colores para comunidades
+        import matplotlib.cm as cm
+        import matplotlib.colors as mcolors
+        community_ids = sorted(set(self.communities[n] for n in nodes_to_plot))
+        cmap = cm.get_cmap("tab20", len(community_ids))
+        color_map = {cid: mcolors.to_hex(cmap(i)) for i, cid in enumerate(community_ids)}
+
+        # Dibujar nodos por comunidad
+        for cid in community_ids:
+            members = [n for n in nodes_to_plot if self.communities[n] == cid]
+            color = color_map[cid]
+            for n in members:
+                lon, lat = pos[n]
+                size = base_size + (attr_values[n] * size_per_unit)
+                ax.scatter(lon, lat,
+                            transform=ccrs.PlateCarree(),
+                            s=size,
+                            color=color,
+                            edgecolor=node_edgecolor,
+                            linewidths=contour_width,
+                            zorder=5,
+                            label=f"Community {cid}" if n == members[0] else None)
+
+        # Ciudades opcionales
+        if cities:
+            for city in cities:
+                ax.scatter(city["lon"], city["lat"],
+                            s=city_size, color=city_color,
+                            edgecolor="black",
+                            transform=ccrs.PlateCarree(), zorder=6)
+                tx_lon, tx_lat = city["text_position"]
+                ax.text(tx_lon, tx_lat, city["name"],
+                        fontsize=city_textsize, fontweight='bold', color="black",
+                        ha="right", va="center",
+                        transform=ccrs.PlateCarree(), zorder=10)
+
+
+                # --- LEYENDA PERSONALIZADA ---
+        import matplotlib.lines as mlines
+
+        # Ordenar comunidades por tamaño (descendente)
+        ordered_communities = sorted(
+            [(cid, self.community_sizes.get(cid, 0)) for cid in community_ids],
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # Crear handles manuales (círculos)
+        handles = []
+        for i, (cid, size) in enumerate(ordered_communities):
+            color = color_map[cid]
+            label = fr"Community {i+1} ($n={{{size}}}$)"
+            # Marker de igual tamaño visual que los nodos
+            marker_size = base_size_legend  # puedes ajustar este factor
+            handle = mlines.Line2D([], [], color=color, marker='o', linestyle='None',
+                                    markersize=np.sqrt(marker_size), markeredgecolor=node_edgecolor)
+            handles.append((cid, handle, label))
+
+        # Crear la leyenda ordenada
+        handles_sorted = [h[1] for h in handles]
+        labels_sorted = [h[2] for h in handles]
+        legend = ax.legend(handles_sorted, labels_sorted,
+                            scatterpoints=1,
+                            loc='best',
+                            fontsize=9,
+                            frameon=True,
+                            title="Communities")
+        legend.get_title().set_fontsize(10)
+
+        if created_fig and show:
+            plt.show()
+
+        if savepath:
+            plt.tight_layout()
+            plt.savefig(savepath, bbox_inches="tight", dpi=dpi)
+
+        return ax
+
+
+
+
+
+# ----------------------------------------- Evolving Network --------------------------------------------- #
+
 class EvolvingNetwork:
     def __init__(self, point_process_df, time_col='t', space_cols=None,
                     dim=2, directed=False, timestamp_method='mean', save_graphs=False):
