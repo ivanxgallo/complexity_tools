@@ -1,17 +1,21 @@
 # point_process.py
+"""
+Module for constructing and analyzing point process networks (PPN) from spatiotemporal event data.
+Author: Iván Gallo-Méndez
+Degree: PhD in Physics
+Research Area: Complex Systems and Network Science
+Email: ivan.gallo@ug.uchile.cl
+Year: 2025
+Country: Chile
+Institution: University of Chile
+"""
 
 import pandas as pd
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
-import traceback
 from collections import Counter
 from tqdm.auto import tqdm
-import os, tempfile, shutil
-import imageio.v2 as imageio
-import imageio.v3 as iio
-from PIL import Image
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 try:
     import cartopy.crs as ccrs
@@ -22,7 +26,33 @@ except Exception:
     _HAS_CARTOPY = False
 
 
-# ---------------- AUXILIAR FUNCTIONS ---------------- #
+# -------------------------------------- AUXILIAR FUNCTIONS ------------------------------------------ #
+# Internal function to generate seasonal intervals according to hemisphere
+def get_season_intervals(start, end, hemisphere, season_colors=None):
+    intervals = []
+    year = start.year
+    while year <= end.year:
+        if hemisphere.lower() == "south":
+            seasons = {
+                "Summer": (pd.Timestamp(f"{year}-12-21"), pd.Timestamp(f"{year+1}-03-20")),
+                "Autumn": (pd.Timestamp(f"{year}-03-21"), pd.Timestamp(f"{year}-06-20")),
+                "Winter": (pd.Timestamp(f"{year}-06-21"), pd.Timestamp(f"{year}-09-22")),
+                "Spring": (pd.Timestamp(f"{year}-09-23"), pd.Timestamp(f"{year}-12-20")),
+            }
+        else:  # hemisferio norte
+            seasons = {
+                "Winter": (pd.Timestamp(f"{year}-12-21"), pd.Timestamp(f"{year+1}-03-20")),
+                "Spring": (pd.Timestamp(f"{year}-03-21"), pd.Timestamp(f"{year}-06-20")),
+                "Summer": (pd.Timestamp(f"{year}-06-21"), pd.Timestamp(f"{year}-09-22")),
+                "Autumn": (pd.Timestamp(f"{year}-09-23"), pd.Timestamp(f"{year}-12-20")),
+            }
+
+        for season, (start_s, end_s) in seasons.items():
+            if end_s >= start and start_s <= end:
+                intervals.append((start_s, end_s, season_colors[season]))
+        year += 1
+    return intervals
+
 def _render_map_frame(task):
     """
     task: dict con:
@@ -82,7 +112,8 @@ def _render_map_frame(task):
 # ----------------------------------------- POINT PROCESS NETWORK ------------------------------------------ #
 
 class PointProcessNetwork:
-    def __init__(self, dim=2, directed=False, df=None, time_col=None, space_cols=None):
+    def __init__(self, dim=2, directed=False, weighted=False, df=None,
+                    time_col=None, space_cols=None, geographic=False):
         if space_cols:
             if isinstance(space_cols, str):
                 space_cols = [space_cols]
@@ -90,6 +121,9 @@ class PointProcessNetwork:
         self.dim = dim
         self.events = None
         self.grid = None
+        self.weighted = weighted
+        self.directed = directed
+        self.geographic = geographic
         self.graph = nx.DiGraph() if directed else nx.Graph()
         if df is not None and space_cols is not None:
             # Si no se especifica columna de tiempo, se crea un contador
@@ -115,7 +149,7 @@ class PointProcessNetwork:
 
     def load_events_from_csv(self, filepath, time_col='t', space_cols=None, sep=" ", n_data=None):
         """
-        Carga eventos desde un archivo CSV.
+        Load events from a CSV file
         """
         if time_col and space_cols:
             df = pd.read_csv(filepath, sep=sep)
@@ -131,39 +165,81 @@ class PointProcessNetwork:
 
     def create_grid(self, cell_size):
         """
-        Crea una grilla con celdas cuadradas (o cúbicas) de lado fijo `cell_size`.
+        Create a spatial grid with (approximately) square or equal-area cells.
 
-        Parámetros:
-        - cell_size: tamaño del lado de las celdas en cada eje (float)
+        Parameters
+        ----------
+        cell_size : float
+            - If geographic=False: cell side length in coordinate units (e.g., degrees or meters).
+            - If geographic=True:  desired cell side length in kilometers (area ≈ cell_size² km²).
+        geographic : bool, optional
+            If True, adjusts longitudinal spacing with latitude to preserve area on Earth's surface.
         """
-
-        assert self.events is not None, "Debes cargar eventos antes de crear la grilla"
+        assert self.events is not None, "Must load events before creating the grid"
 
         coords = self.events.iloc[:, 1:].values
         mins = coords.min(axis=0)
         maxs = coords.max(axis=0)
         sizes = maxs - mins
 
-        num_cells = np.ceil(sizes / cell_size).astype(int)
-        edges = [
-            np.linspace(mins[i], mins[i] + num_cells[i] * cell_size, num_cells[i] + 1)
-            for i in range(self.dim)
-        ]
+        if self.geographic and self.dim == 2:
+            # --- Conversiones de distancia (km) a grados ---
+            mean_lat_deg = np.mean(coords[:, 1])
+            mean_lat_rad = np.deg2rad(mean_lat_deg)
+            cos_lat = np.cos(mean_lat_rad)
 
+            km_per_deg_lat = 111.32                   # km por grado de latitud
+            km_per_deg_lon = 111.32 * cos_lat         # km por grado de longitud (ajustado)
+
+            # Convertir tamaño de celda (en km) a grados
+            dlat = cell_size / km_per_deg_lat
+            dlon = cell_size / km_per_deg_lon
+
+            # --- Construcción de la grilla en grados ---
+            num_cells = np.array([
+                np.ceil(sizes[0] / dlon).astype(int),
+                np.ceil(sizes[1] / dlat).astype(int)
+            ])
+
+            edges = [
+                np.linspace(mins[0], mins[0] + num_cells[0] * dlon, num_cells[0] + 1),
+                np.linspace(mins[1], mins[1] + num_cells[1] * dlat, num_cells[1] + 1)
+            ]
+
+            approx_area_km2 = (cell_size ** 2)
+
+        else:
+            # --- Grilla regular (no geográfica) ---
+            num_cells = np.ceil(sizes / cell_size).astype(int)
+            edges = [
+                np.linspace(mins[i], mins[i] + num_cells[i] * cell_size, num_cells[i] + 1)
+                for i in range(self.dim)
+            ]
+            approx_area_km2 = None  # no aplica
+
+        # --- Guardar grilla ---
         self.grid = {
             'cell_size': cell_size,
+            'geographic': self.geographic,
             'mins': mins,
             'maxs': maxs,
             'num_cells': num_cells,
-            'edges': edges
+            'edges': edges,
+            'approx_area_km2': approx_area_km2
         }
+
+        # --- Mensaje informativo ---
+        if self.geographic and self.dim == 2:
+            print(f"[INFO] Created equal-area grid: ~{approx_area_km2:.2f} km² per cell (Δlat={dlat:.4f}°, Δlon={dlon:.4f}° at {mean_lat_deg:.2f}°)")
+        #else:
+            #print(f"[INFO] Created regular grid with {num_cells} cells (cell_size={cell_size})")
 
 
     def locate_event_cell(self, x):
         """
         Dado un vector de coordenadas, devuelve el índice de la celda en la grilla.
         """
-        assert self.grid is not None, "La grilla no ha sido creada aún"
+        assert self.grid is not None, "The grid is not created yet."
         indices = []
         for i in range(self.dim):
             edges = self.grid['edges'][i]
@@ -191,12 +267,26 @@ class PointProcessNetwork:
                     center.append(0.5 * (edge_start + edge_end))
                 self.graph.add_node(cell, pos=tuple(center))
             if prev_cell is not None:
-                self.graph.add_edge(prev_cell, cell)
+                if self.weighted:
+                    # Modo ponderado: acumula frecuencia
+                    if self.graph.has_edge(prev_cell, cell):
+                        self.graph[prev_cell][cell]["weight"] += 1
+                    else:
+                        self.graph.add_edge(prev_cell, cell, weight=1)
+                else:
+                    # Modo simple: solo crea el enlace si no existe
+                    self.graph.add_edge(prev_cell, cell)
             prev_cell = cell
 
         # --- Eliminar nodos aislados ---
         nodes_to_remove = [n for n in self.graph.nodes if self.graph.degree(n) == 0]
         self.graph.remove_nodes_from(nodes_to_remove)
+
+        if self.weighted:
+            weights = nx.get_edge_attributes(self.graph, "weight")
+            max_w = max(weights.values())
+            for u, v in self.graph.edges():
+                self.graph[u][v]["weight"] /= max_w
 
 
     def connectivity_count(self, kind='total', return_prob=False):
@@ -219,7 +309,7 @@ class PointProcessNetwork:
             assert self.graph.is_directed(), "El grafo no es dirigido"
             degrees = [deg for _, deg in self.graph.out_degree()]
         else:
-            raise ValueError("Parámetro 'kind' debe ser 'total', 'in' o 'out'")
+            raise ValueError("Parameter 'kind' must be 'total', 'in' or 'out'")
 
         count = Counter(degrees)
         max_degree = max(count.keys())
@@ -324,25 +414,47 @@ class PointProcessNetwork:
 
         self.stats = stats
 
+        # --- Coeficiente de asortatividad ---
+        try:
+            assortativity = nx.degree_assortativity_coefficient(self.graph)
+            stats['assortativity'] = assortativity
+        except Exception as e:
+            stats['assortativity'] = None
+            print(f"[WARN] Error computing assortativity: {e}")
+
+        # --- numero de comunidades (Louvain) ---
+        try:
+            import community as community_louvain
+            partition = community_louvain.best_partition(self.graph.to_undirected())
+            n_communities = len(set(partition.values()))
+            stats['n_communities'] = n_communities
+        except Exception as e:
+            stats['n_communities'] = None
+            print(f"[WARN] Error computing number of communities: {e}")
+
         return stats
 
 
     def plot_on_map(self, ax=None, *,
+                fs_ticks=15,
                 node_attribute="degree",      # NUEVO: atributo a graficar
                 percentile=None,              # NUEVO: filtro por percentil
                 base_size=2.0,
-                size_per_unit=1.0,             # escalado genérico
+                max_size=1000,
                 edge_width=0.3,
                 edge_alpha=0.25,
                 node_edgecolor='black',
                 node_facecolor='blue',
                 road_color='red',
                 contour_width=0.4,
+                add_background=False,
+                add_roads=True,
                 add_features=True,
+                road_width=1.0,
                 extent='auto',
                 extent_margin=(1.0, 0.25),
                 cities=None,
-                city_size=70,
+                city_size=50,
                 city_color="gold",
                 city_textsize=12,
                 show_edges=True,               # NUEVO: mostrar o no enlaces
@@ -368,7 +480,7 @@ class PointProcessNetwork:
         # Posiciones de nodos
         pos = nx.get_node_attributes(self.graph, 'pos')
         if not pos:
-            raise ValueError("No hay posiciones 'pos' en los nodos. ¿Llamaste a build_sequential_graph()?")
+            raise ValueError("There are no positions 'pos' in nodes. Excecute build_sequential_graph()")
 
         # Extent automático
         if extent == 'auto':
@@ -382,23 +494,35 @@ class PointProcessNetwork:
         if extent is not None:
             ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-        # Features base
-        if add_features:
+
+        # roads feature
+        if add_roads:
             roads = NaturalEarthFeature(
-            category="cultural",  # Tipo de datos: culturales
-            name="roads",         # Carreteras
-            scale="10m",          # Resolución: 10m es la más detallada
-            facecolor="none"      # Sin color de relleno
+                category="cultural",  # Tipo de datos: culturales
+                name="roads",         # Carreteras
+                scale="10m",          # Resolución: 10m es la más detallada
+                facecolor="none"      # Sin color de relleno
             )
 
-            ax.add_feature(roads, edgecolor=road_color, linewidth=1, alpha=0.7)
+            ax.add_feature(roads, edgecolor=road_color, linewidth=road_width, alpha=0.7)
+
+        if add_background:
+            ax.stock_img()
+
+        # Features base
+        if add_features:
             ax.add_feature(cfeature.COASTLINE, linewidth=1)
             ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5)
             ax.add_feature(cfeature.LAND, facecolor='lightgray')
             ax.add_feature(cfeature.OCEAN, facecolor='lightblue')
+
             gl = ax.gridlines(draw_labels=True, color="gray", alpha=0.5, linestyle="--")
             gl.top_labels = False
             gl.right_labels = False
+
+            # Ajustar tamaño de fuente de los ticks (Cartopy)
+            gl.xlabel_style = {"size": fs_ticks}
+            gl.ylabel_style = {"size": fs_ticks}
 
         # Obtener valores del atributo
         if node_attribute == "degree":
@@ -430,33 +554,47 @@ class PointProcessNetwork:
                             alpha=edge_alpha,
                             zorder=4)
 
-        # Dibujar nodos
-        for n in nodes_to_plot:
+        # --- Escalado adaptativo del tamaño de los nodos ---
+        values = np.array([attr_values[n] for n in nodes_to_plot])
+        vmin, vmax = np.min(values), np.max(values)
+
+        # Evitar división por cero si todos son iguales
+        if vmax == vmin:
+            norm_sizes = np.ones_like(values)
+        else:
+            norm_sizes = (values - vmin) / (vmax - vmin)
+
+        # Escala final (visual, independiente de los valores absolutos)
+        min_size, max_size = base_size, max_size  # puedes ajustar este rango
+        scaled_sizes = min_size + norm_sizes * (max_size - min_size)
+
+        # --- Dibujar nodos escalados ---
+        for n, size in zip(nodes_to_plot, scaled_sizes):
             lon, lat = pos[n]
-            size = base_size + (attr_values[n] * size_per_unit)
             ax.scatter(lon, lat,
                         transform=ccrs.PlateCarree(),
                         s=size,
                         color=node_facecolor,
                         edgecolor=node_edgecolor,
                         linewidths=contour_width,
-                        zorder=5)
+                        zorder=int(size))
 
         # Ciudades opcionales
         if cities:
+            bigger = max(scaled_sizes)
             for city in cities:
                 ax.scatter(city["lon"], city["lat"],
                             s=city_size,
                             color=city_color,
                             edgecolor="black",
                             transform=ccrs.PlateCarree(),
-                            zorder=6)
+                            zorder=bigger + 1)
                 tx_lon, tx_lat = city["text_position"]
                 ax.text(tx_lon, tx_lat, city["name"],
                         fontsize=city_textsize, fontweight='bold', color="black",
                         ha="right", va="center",
                         transform=ccrs.PlateCarree(),
-                        zorder=10)
+                        zorder=bigger + 2)
 
         if savepath:
             plt.tight_layout()
@@ -744,18 +882,29 @@ class PointProcessNetwork:
         return self.r_global
 
 
-    def detect_communities(self):
+    def detect_communities(self, resolution=1.0, random_state=None):
         """
         Detecta comunidades en el grafo usando el método de Louvain.
 
-        Guarda internamente:
-        - self.communities : dict {nodo: comunidad_id}
-        - self.community_sizes : dict {comunidad_id: número de nodos}
-        - self.communities_sorted : lista de tuplas (comunidad_id, tamaño) ordenadas por tamaño descendente.
+        Parámetros
+        ----------
+        resolution : float, opcional (default=1.0)
+            Controla la granularidad de las comunidades detectadas.
+            - Valores menores a 1 → menos comunidades (más grandes).
+            - Valores mayores a 1 → más comunidades (más pequeñas).
+        random_state : int | None, opcional
+            Semilla del generador aleatorio para obtener resultados reproducibles.
+
+        Guarda internamente
+        -------------------
+        - self.communities : dict {nodo: comunidad_id_ordenado}
+        - self.community_sizes : dict {comunidad_id_ordenado: número de nodos}
+        - self.communities_sorted : lista [(comunidad_id_ordenado, tamaño), ...] ordenadas por tamaño descendente.
 
         Retorna
         -------
-        dict : {nodo: comunidad_id}
+        dict
+            Diccionario {nodo: comunidad_id_ordenado}
         """
         if self.graph.number_of_nodes() == 0:
             raise ValueError("Graph is empty. Build it first.")
@@ -763,23 +912,48 @@ class PointProcessNetwork:
         try:
             import community as community_louvain  # paquete 'python-louvain'
         except ImportError:
-            raise ImportError("Debe instalar el paquete 'python-louvain': pip install python-louvain")
+            raise ImportError("Must install the library 'python-louvain': pip install python-louvain")
 
-        # --- Detección de comunidades ---
-        partition = community_louvain.best_partition(self.graph)
-        self.communities = partition
+        # --- Detección de comunidades con control de resolución ---
+        if self.weighted:
+            partition = community_louvain.best_partition(
+                self.graph,
+                resolution=resolution,
+                random_state=random_state,
+                weight = 'weight'
+            )
+        else:
+            partition = community_louvain.best_partition(
+                self.graph,
+                resolution=resolution,
+                random_state=random_state
+            )
 
-        # --- Calcular tamaños ---
+        # --- Calcular tamaños originales ---
         sizes = Counter(partition.values())
-        self.community_sizes = dict(sizes)
 
-        # --- Ordenar comunidades por tamaño ---
-        self.communities_sorted = sorted(sizes.items(), key=lambda x: x[1], reverse=True)
+        # --- Ordenar comunidades por tamaño (descendente) ---
+        sorted_by_size = sorted(sizes.items(), key=lambda x: x[1], reverse=True)
+
+        # --- Crear mapeo antiguo → nuevo ID ---
+        remap = {old_id: new_id+1 for new_id, (old_id, _) in enumerate(sorted_by_size)}
+
+        # --- Reasignar IDs en el diccionario de comunidades ---
+        partition_renamed = {node: remap[old_cid] for node, old_cid in partition.items()}
+
+        # --- Guardar estructuras internas ---
+        self.communities = partition_renamed
+        self.community_sizes = {remap[old_id]: size for old_id, size in sizes.items()}
+        self.communities_sorted = sorted(self.community_sizes.items(), key=lambda x: x[1], reverse=True)
+
+
+        # mensaje informativo
+        print(f"[INFO] {len(self.communities_sorted)} detected communities (res={resolution})")
 
         return self.communities
 
 
-    def get_community_summary(self, top=None):
+    def get_community_summary(self, top=None, resolution=1.0, random_state=None):
         """
         Retorna el resumen de comunidades detectadas.
 
@@ -792,28 +966,31 @@ class PointProcessNetwork:
         -------
         dict : {comunidad_id: tamaño}
         """
-        if not hasattr(self, "community_sizes"):
-            communities = self.detect_communities()
+
+        _ = self.detect_communities(resolution=resolution, random_state=random_state)
 
         if top is None:
-            return self.community_sizes
+            return dict(self.communities_sorted)
 
-        top_communities = dict(self.communities_sorted[:top])
-        return top_communities
+        return dict(self.communities_sorted[:top])
 
 
     def plot_communities_on_map(self, ax=None, *,
-                                community_list=None,
+                                fs_ticks=18,
+                                fs_legend=15,
+                                legend_location='best',
+                                communities=None,
                                 node_attribute="degree",
                                 percentile=None,
                                 percentile_mode="global",
                                 base_size=2.0,
-                                size_per_unit=1.0,
+                                max_size=50,
                                 edge_width=0.3,
                                 edge_alpha=0.25,
                                 node_edgecolor='black',
                                 contour_width=0.4,
                                 add_features=True,
+                                add_roads=True,
                                 extent='auto',
                                 extent_margin=(1.0, 0.25),
                                 cities=None,
@@ -824,13 +1001,14 @@ class PointProcessNetwork:
                                 base_size_legend=50,
                                 savepath=None,
                                 dpi=200, figsize=(6, 6),
-                                show=True):
+                                show=True,
+                                color_palette=None):
         """
         Dibuja las comunidades sobre un mapa (lon, lat), coloreando por comunidad.
 
         Parámetros
         ----------
-        community_list : list[int] | None
+        communities : list[int] | None
             IDs de comunidades a mostrar. Si None, se muestran todas.
         node_attribute : str
             Atributo de los nodos que define el tamaño ('degree', 'bc', etc.)
@@ -838,8 +1016,14 @@ class PointProcessNetwork:
         if not _HAS_CARTOPY:
             raise ImportError("Cartopy is not installed. Use `pip install cartopy`")
 
-        if not hasattr(self, "communities"):
-            raise ValueError("Debe ejecutar detect_communities() primero.")
+        if not hasattr(self, "communities_sorted"):
+            raise ValueError("Must excecute detect_communities() first.")
+
+        # if communities is int then make it a list
+        if communities is None:
+            raise ValueError("Parameter 'communities' must be a list of community IDs.")
+        elif isinstance(communities, int):
+            communities = [communities]
 
         # Crear figura/ax si no viene uno
         created_fig = False
@@ -864,19 +1048,26 @@ class PointProcessNetwork:
         if extent is not None:
             ax.set_extent(extent, crs=ccrs.PlateCarree())
 
-        # Features base
-        if add_features:
+        if add_roads:
             roads = NaturalEarthFeature(
                 category="cultural", name="roads", scale="10m", facecolor="none"
             )
             ax.add_feature(roads, edgecolor='red', linewidth=1, alpha=0.7)
+
+        # Features base
+        if add_features:
             ax.add_feature(cfeature.COASTLINE, linewidth=1)
             ax.add_feature(cfeature.BORDERS, linestyle=':', linewidth=0.5)
             ax.add_feature(cfeature.LAND, facecolor='lightgray')
             ax.add_feature(cfeature.OCEAN, facecolor='lightblue')
+
             gl = ax.gridlines(draw_labels=True, color="gray", alpha=0.5, linestyle="--")
             gl.top_labels = False
             gl.right_labels = False
+
+            # Ajustar tamaño de fuente de los ticks (Cartopy)
+            gl.xlabel_style = {"size": fs_ticks}
+            gl.ylabel_style = {"size": fs_ticks}
 
         # Valores de atributo (para tamaño)
         if node_attribute == "degree":
@@ -884,7 +1075,7 @@ class PointProcessNetwork:
         else:
             sample_node = next(iter(self.graph.nodes))
             if node_attribute not in self.graph.nodes[sample_node]:
-                raise ValueError(f"El atributo '{node_attribute}' no está calculado en los nodos.")
+                raise ValueError(f"The attribute '{node_attribute}' is not calculated for nodes in graph.")
             attr_values = nx.get_node_attributes(self.graph, node_attribute)
 
         # --- Filtro por percentil (adaptativo: global o local) ---
@@ -902,7 +1093,7 @@ class PointProcessNetwork:
                 # --- Local: un umbral distinto por comunidad ---
                 nodes_to_plot = []
                 communities_in_plot = (
-                    community_list if community_list is not None
+                    communities if communities is not None
                     else sorted(set(self.communities.values()))
                 )
                 for cid in communities_in_plot:
@@ -915,9 +1106,9 @@ class PointProcessNetwork:
                     nodes_to_plot.extend(selected)
 
         # Filtrar comunidades si se pide
-        if community_list is not None:
+        if communities is not None:
             nodes_to_plot = [n for n in nodes_to_plot
-                                if self.communities.get(n) in community_list]
+                                if self.communities.get(n) in communities]
 
         # Mostrar aristas
         if show_edges:
@@ -932,28 +1123,59 @@ class PointProcessNetwork:
                             alpha=edge_alpha,
                             zorder=4)
 
-        # Paleta de colores para comunidades
-        import matplotlib.cm as cm
-        import matplotlib.colors as mcolors
+        # Paleta de colores para comunidades (manual, más legible)
         community_ids = sorted(set(self.communities[n] for n in nodes_to_plot))
-        cmap = cm.get_cmap("tab20", len(community_ids))
-        color_map = {cid: mcolors.to_hex(cmap(i)) for i, cid in enumerate(community_ids)}
 
-        # Dibujar nodos por comunidad
+        # Lista con los 10 colores más reconocibles (puedes ajustar tonos)
+        if color_palette is None:
+            color_palette = [
+                "#e41a1c",  # rojo
+                "#377eb8",  # azul
+                "#4daf4a",  # verde
+                "#ff7f00",  # naranja
+                "#ffff33",  # amarillo
+                "#984ea3",  # violeta
+                "#a65628",  # marrón
+                "#f781bf",  # rosa
+                "#999999",  # gris
+                "#66c2a5"   # turquesa
+            ]
+
+        # Si hay más comunidades que colores, cicla la lista
+        color_map = {cid: color_palette[(cid-1) % len(color_palette)] for cid in community_ids}
+
+
+        # --- Escalado adaptativo del tamaño de los nodos ---
+        values = np.array([attr_values[n] for n in nodes_to_plot])
+        vmin, vmax = np.min(values), np.max(values)
+
+        # Evita división por cero si todos los valores son iguales
+        if vmax == vmin:
+            norm_sizes = np.ones_like(values)
+        else:
+            norm_sizes = (values - vmin) / (vmax - vmin)
+
+        # Escala final: mapea al rango [base_size, max_size]
+        min_size, max_size_plot = base_size, max_size
+        scaled_sizes = min_size + norm_sizes * (max_size_plot - min_size)
+
+        # --- Dibujar nodos por comunidad con tamaños escalados ---
         for cid in community_ids:
             members = [n for n in nodes_to_plot if self.communities[n] == cid]
             color = color_map[cid]
             for n in members:
                 lon, lat = pos[n]
-                size = base_size + (attr_values[n] * size_per_unit)
+                # Toma el tamaño escalado correspondiente al nodo
+                size = scaled_sizes[nodes_to_plot.index(n)]
                 ax.scatter(lon, lat,
                             transform=ccrs.PlateCarree(),
                             s=size,
                             color=color,
                             edgecolor=node_edgecolor,
                             linewidths=contour_width,
-                            zorder=5,
-                            label=f"Community {cid}" if n == members[0] else None)
+                            zorder=int(size),
+                            )
+
 
         # Ciudades opcionales
         if cities:
@@ -969,7 +1191,7 @@ class PointProcessNetwork:
                         transform=ccrs.PlateCarree(), zorder=10)
 
 
-                # --- LEYENDA PERSONALIZADA ---
+        # --- LEYENDA PERSONALIZADA ---
         import matplotlib.lines as mlines
 
         # Ordenar comunidades por tamaño (descendente)
@@ -981,34 +1203,171 @@ class PointProcessNetwork:
 
         # Crear handles manuales (círculos)
         handles = []
-        for i, (cid, size) in enumerate(ordered_communities):
+        for cid, size in ordered_communities:
             color = color_map[cid]
-            label = fr"Community {i+1} ($n={{{size}}}$)"
+            label = fr"Community {cid} ($n={{{size}}}$)"
             # Marker de igual tamaño visual que los nodos
             marker_size = base_size_legend  # puedes ajustar este factor
             handle = mlines.Line2D([], [], color=color, marker='o', linestyle='None',
                                     markersize=np.sqrt(marker_size), markeredgecolor=node_edgecolor)
             handles.append((cid, handle, label))
 
+        # agregar cities a la leyenda si las hay
+        if cities:
+            city_handle = mlines.Line2D([], [], color=city_color, marker='o', linestyle='None',
+                                        markersize=np.sqrt(base_size_legend), markeredgecolor='black')
+            handles.append((
+                'city', city_handle, "City"
+            ))
+
         # Crear la leyenda ordenada
         handles_sorted = [h[1] for h in handles]
         labels_sorted = [h[2] for h in handles]
         legend = ax.legend(handles_sorted, labels_sorted,
                             scatterpoints=1,
-                            loc='best',
-                            fontsize=9,
+                            loc=legend_location,
+                            fontsize=fs_legend,
                             frameon=True,
-                            title="Communities")
+                            title=None)
         legend.get_title().set_fontsize(10)
-
-        if created_fig and show:
-            plt.show()
 
         if savepath:
             plt.tight_layout()
             plt.savefig(savepath, bbox_inches="tight", dpi=dpi)
 
+        if created_fig and show:
+            plt.show()
+
         return ax
+
+
+    def plot_attribute_distribution(self, attribute, *,
+                                    bins=30,
+                                    normalize=True,
+                                    logbins=True,
+                                    pl_fit=False,
+                                    fit_bins_range=None,
+                                    fit_range=None,
+                                    correction = 1.0,
+                                    xlog=True,
+                                    ylog=True,
+                                    xlabel=None,
+                                    ylabel=None,
+                                    title=None,
+                                    figsize=(6,4),
+                                    dpi=200,
+                                    fs_labels=15,
+                                    color="blue",
+                                    marker="o-",
+                                    alpha=0.8,
+                                    linewidth=2,
+                                    savepath=None,
+                                    show=True):
+
+        # --- Obtener valores ---
+        if attribute == "degree":
+            values = [d for _, d in self.graph.degree()]
+        elif attribute == "bc":
+            sample = next(iter(self.graph.nodes))
+            if "bc" not in self.graph.nodes[sample]:
+                raise ValueError("The attribute 'bc' is not calculated.")
+            values = list(nx.get_node_attributes(self.graph, "bc").values())
+        else:
+            sample = next(iter(self.graph.nodes))
+            if attribute not in self.graph.nodes[sample]:
+                raise ValueError(f"The attribute '{attribute}' is not present.")
+            values = list(nx.get_node_attributes(self.graph, attribute).values())
+
+        if len(values) == 0:
+            raise ValueError("No values to plot.")
+
+        # Etiquetas
+        if xlabel is None:
+            xlabel = attribute
+        if ylabel is None:
+            ylabel = "PDF" if normalize else "Counts"
+
+        plt.figure(figsize=figsize, dpi=dpi)
+
+        # --- LOGARITHMIC BINS ---
+        if logbins:
+            vals_pos = np.array([v for v in values if v > 0])
+            min_val, max_val = vals_pos.min(), vals_pos.max()
+            bins = np.logspace(np.log10(min_val), np.log10(max_val), bins)
+
+        # --- Histograma ---
+        h, b = np.histogram(values, bins=bins, density=True if normalize else False)
+
+        # Filtrar ceros
+        b_plot = np.array(b[:-1])
+        h_plot = np.array(h)
+        mask = h_plot > 0
+        b_plot = b_plot[mask]
+        h_plot = h_plot[mask]
+
+        # --- Plot principal ---
+        plt.plot(b_plot, h_plot, marker, color=color, alpha=alpha,
+                linewidth=linewidth, label=attribute)
+
+
+        # --- Fit power law con error ---
+        if pl_fit:
+            from scipy.stats import linregress
+
+            # Selección de puntos del fit
+            mask_fit = (b_plot > 0) & (h_plot > 0)
+
+            if fit_bins_range is not None:
+                xmin, xmax = fit_bins_range
+                mask_fit &= (b_plot >= xmin) & (b_plot <= xmax)
+
+            x_fit = b_plot[mask_fit]
+            y_fit = h_plot[mask_fit]
+
+            if len(x_fit) >= 2:
+
+                # Fit log-log con error estándar
+                lr = linregress(np.log(x_fit), np.log(y_fit))
+                a = lr.slope                     # exponente
+                c = lr.intercept                 # prefactor
+                a_err = lr.stderr                # error del exponente
+                c_err = lr.intercept_stderr      # error del coeficiente
+
+                # Rango para graficar la línea
+                if fit_range is None:
+                    xmin, xmax = fit_bins_range
+                else:
+                    xmin, xmax = fit_range
+
+                x_line = np.logspace(np.log10(xmin), np.log10(xmax), 200)
+                y_line = correction * np.exp(c) * x_line**a   # power law line
+
+                # Plot del fit
+                plt.plot(x_line, y_line, "k-", linewidth=2,
+                        label=fr"Fit $\sim x^{{{a:.2f} \pm {a_err:.2f}}}$")
+
+        # Escalas
+        if xlog:
+            plt.xscale("log")
+        if ylog:
+            plt.yscale("log")
+
+        plt.xlabel(xlabel, fontsize=fs_labels)
+        plt.ylabel(ylabel, fontsize=fs_labels)
+        if title:
+            plt.title(title, fontsize=fs_labels)
+
+        plt.grid(True, alpha=0.3)
+        if pl_fit:
+            plt.legend()
+
+        if savepath:
+            plt.savefig(savepath, bbox_inches="tight", dpi=dpi)
+
+        if show:
+            plt.show()
+        else:
+            return b_plot, h_plot
 
 
 
@@ -1190,20 +1549,119 @@ class EvolvingNetwork:
             raise ValueError("Method must be 'event' or 'time'")
 
 
-    def plot_stat(self, stat_name, **kwargs):
-        times = self.time
+    def plot_stat(self, stat_name, figsize=(10, 5), seasons=False,
+                hemisphere="south", dpi=200, rotation=45,
+                font_size=18, color='black', marker='o',
+                savepath=None, ylim=None, show=True, alpha_season=0.7):
+        """
+        Plotea la evolución temporal de una métrica específica de la red,
+        con opción de fondo estacional según el hemisferio.
+
+        Parámetros
+        ----------
+        stat_name : str
+            Nombre de la métrica a graficar (clave de self.stats).
+            Ejemplo: 'n_nodes', 'entropy', 'clustering', etc.
+
+        figsize : tuple, opcional
+            Tamaño de la figura (default: (10, 5)).
+
+        stations : bool, opcional
+            Si True, colorea el fondo según las estaciones del año.
+
+        hemisphere : {'south', 'north'}
+            Define el hemisferio para las estaciones (default: 'south').
+
+        dpi : int
+            Resolución de la figura.
+
+        rotation : int
+            Rotación de las etiquetas del eje X.
+
+        font_size : int
+            Tamaño base de fuente.
+
+        color, marker : str
+            Color y marcador de la curva principal.
+
+        savepath : str | None
+            Si se entrega, guarda la figura en esa ruta.
+
+        ylim : tuple | None
+            Límite del eje Y.
+
+        show : bool
+            Si False, no muestra el gráfico (útil para generar reportes automáticos).
+        """
+        import matplotlib.patches as mpatches
+
+        # --- Validaciones básicas ---
+        if not hasattr(self, "stats") or len(self.stats) == 0:
+            raise ValueError("No statistics registered. Excecute 'do_evolution() first'.")
+        if stat_name not in self.stats[0]:
+            raise KeyError(f"'{stat_name}' is not a valid metric. Available keys: {list(self.stats[0].keys())}")
+
+        # --- Extraer serie temporal ---
+        times = pd.to_datetime(self.time)
         values = [s[stat_name] for s in self.stats]
-        plt.figure(dpi=200)
-        plt.plot(times, values, marker='o')
-        plt.title(f"Evolución de {stat_name}")
-        plt.xlabel("Tiempo")
-        plt.ylabel(stat_name)
-        plt.grid(True)
-        plt.tight_layout()
-        plt.show()
+
+        # --- Crear figura y eje ---
+        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+
+        # --- Fondo estacional opcional ---
+        if seasons:
+            season_colors = {
+                "Summer": "#FFDD44",
+                "Autumn": "#D2B48C",
+                "Winter": "#ADD8E6",
+                "Spring": "#90EE90",
+            }
+
+            start_date, end_date = min(times), max(times)
+            intervals = get_season_intervals(start_date, end_date, hemisphere, season_colors)
+
+            # Fondo de color por estación
+            for start_s, end_s, color_patch in intervals:
+                ax.axvspan(start_s, end_s, color=color_patch, alpha=alpha_season)
+
+            # Leyenda de estaciones
+            season_order = ["Summer", "Autumn", "Winter", "Spring"] if hemisphere == "south" \
+                            else ["Winter", "Spring", "Summer", "Autumn"]
+
+            legend_patches = [mpatches.Patch(color=season_colors[s], label=s) for s in season_order]
+            fig.legend(
+                handles=legend_patches,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 1.08),   # ← sube la leyenda (ajusta 1.05–1.15 según el caso)
+                ncol=4,
+                fontsize=font_size - 4,
+                frameon=False,
+                title=None
+            )
+
+        # --- Curva principal ---
+        ax.plot(times, values, color=color, marker=marker, linestyle='-', linewidth=1.5)
+        ax.set_ylabel(stat_name, fontsize=font_size)
+        ax.set_xlabel("Time", fontsize=font_size)
+        ax.tick_params(axis="x", rotation=rotation, labelsize=font_size - 4)
+        ax.tick_params(axis="y", labelsize=font_size - 4)
+        ax.grid(True, alpha=0.4)
+        if ylim:
+            ax.set_ylim(ylim)
+
+        # --- Estilo y guardado ---
+        plt.tight_layout(rect=[0, 0, 1, 0.98])
+        if savepath:
+            plt.savefig(savepath, bbox_inches='tight', dpi=dpi)
+        if show:
+            plt.show()
+        plt.close(fig)
 
 
-    def plot_all_stats(self, last=None, figsize=(10, 15), dpi=200, rotation=45, font_size=18, savepath=None):
+
+    def plot_all_stats(self, last=None, figsize=(10, 15), seasons=False,
+                        hemisphere="south", dpi=200, rotation=45, font_size=18,
+                        savepath=None, alpha_season=0.7):
         """
         Plotea todas las métricas principales de la evolución de la red en subplots separados.
 
@@ -1244,6 +1702,40 @@ class EvolvingNetwork:
         # Crear figura
         fig, axes = plt.subplots(nrows=len(metrics), figsize=figsize, sharex=True, dpi=dpi)
 
+
+        if seasons:
+            import matplotlib.patches as mpatches
+            season_colors = {
+                "Summer": "#FFDD44",  # Amarillo dorado
+                "Autumn": "#D2B48C",  # Marrón claro
+                "Winter": "#ADD8E6",  # Celeste
+                "Spring": "#90EE90",  # Verde claro
+            }
+
+            # Obtener rango temporal
+            start_date = pd.to_datetime(min(times))
+            end_date = pd.to_datetime(max(times))
+            intervals = get_season_intervals(start_date, end_date, hemisphere, season_colors)
+
+            # Pintar fondo de estaciones
+            for ax in axes:
+                for start_s, end_s, color in intervals:
+                    ax.axvspan(start_s, end_s, color=color, alpha=alpha_season)
+
+            # Leyenda de estaciones
+            legend_patches = [
+                mpatches.Patch(color=c, label=s) for s, c in season_colors.items()
+            ]
+            fig.legend(
+                handles=legend_patches,
+                loc="upper center",
+                ncol=4,
+                fontsize=font_size - 3,
+                frameon=False,
+                title=None
+            )
+
+        # Plots individuales
         for ax, (name, values) in zip(axes, metrics.items()):
             ax.plot(times, values, marker='.', linestyle='-', color='black')
             ax.set_ylabel(name, fontsize=font_size)
@@ -1261,141 +1753,6 @@ class EvolvingNetwork:
 
 
     def make_map_gif(self, out_path, *,
-                    fps=4,
-                    cities=None,
-                    extent="auto_union",      # 'auto' | 'auto_union' | tuple(min_lon,max_lon,min_lat,max_lat) | None
-                    extent_margin=(1.0, 0.25),
-                    annotate_time=True,
-                    time_fmt="%Y-%m-%d",
-                    time_loc="ul",            # 'ul','ur','ll','lr'
-                    time_fontsize=12,
-                    time_box=True,
-                    dpi=200, figsize=(6, 6),
-                    # Parámetros que se pasan a plot_on_map:
-                    degree_weight=True,
-                    base_size=2.0,
-                    size_per_degree=1.0,
-                    edge_width=0.3,
-                    edge_alpha=0.25,
-                    node_edgecolor='black',
-                    node_facecolor='red',
-                    contour_width=0.4,
-                    add_features=True,
-                    show=False,
-                    loop=0):
-        """
-        Genera un GIF con los snapshots guardados en self.graphs dibujados sobre mapa.
-        Requiere EvolvingNetwork(..., save_graphs=True) y do_evolution() ya ejecutado.
-
-        - extent:
-            'auto_union': usa bounding box global de todos los snapshots (recomendado)
-            'auto': cada frame autoajusta su extent (puede "temblar")
-            tuple: (min_lon, max_lon, min_lat, max_lat)
-            None: no fija extent
-        - annotate_time: si True, escribe self.time[idx] en cada frame
-        - time_loc: esquina ('ul' arriba-izq, 'ur' arriba-der, 'll' abajo-izq, 'lr' abajo-der)
-        """
-        if not self.save_graph:
-            raise ValueError("No graphs saved. Initialize with save_graphs=True and execute do_evolution().")
-        if len(self.graphs) == 0:
-            raise ValueError("self.graphs is empty. Did you execute do_evolution()?")
-
-        # --- Calcular extent fijo si se pide 'auto_union' ---
-        fixed_extent = None
-        if extent == "auto_union":
-            all_lons, all_lats = [], []
-            for G in self.graphs:
-                pos = nx.get_node_attributes(G, 'pos')
-                if not pos:
-                    continue
-                lons = [p[0] for p in pos.values()]
-                lats = [p[1] for p in pos.values()]
-                all_lons.extend(lons)
-                all_lats.extend(lats)
-            if len(all_lons) == 0:
-                raise ValueError("No hay posiciones 'pos' en los nodos de los snapshots.")
-            dx, dy = extent_margin
-            fixed_extent = (min(all_lons) - dx, max(all_lons) + dx, min(all_lats) - dy, max(all_lats) + dy)
-        elif isinstance(extent, tuple):
-            fixed_extent = extent
-        elif extent in ("auto", None):
-            fixed_extent = extent
-        else:
-            raise ValueError("Parametro 'extent' inválido. Usa 'auto_union', 'auto', tuple o None.")
-
-        # --- Carpeta temporal para frames ---
-        tmpdir = tempfile.mkdtemp(prefix="mapgif_")
-        frame_paths = []
-
-        try:
-            for idx, G in enumerate(tqdm(self.graphs, desc="Rendering GIF frames")):
-                # dummy PPN para reutilizar plot_on_map
-                ppn = PointProcessNetwork(dim=self.dim, directed=self.directed)
-                ppn.graph = G
-
-                # Dibujar frame
-                ax = ppn.plot_on_map(
-                    ax=None,
-                    degree_weight=degree_weight,
-                    base_size=base_size,
-                    size_per_degree=size_per_degree,
-                    edge_width=edge_width,
-                    edge_alpha=edge_alpha,
-                    node_edgecolor=node_edgecolor,
-                    node_facecolor=node_facecolor,
-                    contour_width=contour_width,
-                    add_features=add_features,
-                    extent=fixed_extent if fixed_extent is not None else 'auto',
-                    extent_margin=extent_margin,
-                    cities=cities,
-                    dpi=dpi, figsize=figsize,
-                    show=show
-                )
-
-                # --- Timestamp en el frame ---
-                if annotate_time and idx < len(self.time):
-                    ts = self.time[idx]
-                    try:
-                        label = ts.strftime(time_fmt)
-                    except Exception:
-                        label = str(ts)
-
-                    # Coordenadas en el sistema del eje (0..1), no dependen del extent
-                    locs = {
-                        "ul": (0.02, 0.98, "left",  "top"),
-                        "ur": (0.98, 0.98, "right", "top"),
-                        "ll": (0.02, 0.02, "left",  "bottom"),
-                        "lr": (0.98, 0.02, "right", "bottom"),
-                    }
-                    x, y, ha, va = locs.get(time_loc, locs["ul"])
-                    bbox = dict(facecolor='white', alpha=0.65, edgecolor='none', pad=2) if time_box else None
-
-                    ax.text(x, y, label,
-                            transform=ax.transAxes,
-                            fontsize=time_fontsize,
-                            fontweight='bold',
-                            ha=ha, va=va,
-                            bbox=bbox)
-
-                # Guardar frame
-                frame_path = os.path.join(tmpdir, f"frame_{idx:04d}.png")
-                plt.savefig(frame_path, bbox_inches="tight", dpi=dpi)
-                plt.close()
-                frame_paths.append(frame_path)
-
-            # --- Escribir GIF ---
-            images = [imageio.imread(p) for p in frame_paths]
-            duration = 1.0 / float(fps)
-            imageio.mimsave(out_path, images, duration=duration, loop=loop)
-
-        finally:
-            # Limpiar temporales
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-        return out_path
-
-
-    def make_map_gif_faster(self, out_path, *,
                         duration=1,               # segundos por frame
                         cities=None,
                         extent="auto_union",
@@ -1424,6 +1781,11 @@ class EvolvingNetwork:
                         loop=0,
                         n_jobs=1,
                         max_side=None):
+
+        import os, tempfile, shutil, traceback
+        from PIL import Image
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import imageio.v3 as iio
 
         if not self.save_graph:
             raise ValueError("No graphs saved. Initialize with save_graphs=True and execute do_evolution().")
